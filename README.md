@@ -4,12 +4,20 @@
 
 对应 Linux 参考脚本：<https://github.com/chaihahaha/git-cheatsheet> 中的 `clone_1by1.sh`。
 
+交互式全屏 TUI（无参数启动进入向导；克隆中可暂停 / 停止，重跑同一命令续传）：
+
+| 向导 | 克隆中 |
+| --- | --- |
+| ![向导主页面](snap/main.png) | ![克隆运行界面](snap/run.png) |
+
 ## 文件
 
 | 文件 | 说明 |
 | --- | --- |
 | `git-clone-resume.ps1` | 主脚本，PowerShell 5.1 / 7+ |
-| `git-clone-resume.cmd` | 双击或 cmd 下调用的启动器 |
+| `git-clone-resume.tui.ps1` | 全屏 TUI（向导、进度面板、快捷键），由主脚本自动加载 |
+| `git-clone-resume.cmd` | 双击或 cmd 下调用的启动器（无参数会打开 TUI 向导） |
+| `snap/` | README 截图（向导主页面、克隆运行界面） |
 
 ## 依赖
 
@@ -19,15 +27,21 @@
 
 ## 用法
 
+交互式（推荐）：双击 `git-clone-resume.cmd`，或在终端里不带 URL 运行，会打开全屏 TUI 向导。剪贴板里如果是仓库地址会自动填入；底栏会显示当前选项的简短说明。
+
 ```bat
+git-clone-resume.cmd
 git-clone-resume.cmd https://github.com/user/repo.git
 ```
 
 或：
 
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1 https://github.com/user/repo.git
 ```
+
+在 Windows Terminal / 现代控制台里，带 URL 启动同样进入进度面板：百分比、ETA、活动日志、失败列表。脚本/CI 或输出被重定向时自动退回原来的纯日志模式。
 
 常用参数：
 
@@ -46,9 +60,35 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1 https
 
 # 只列出文件，不下载 blob
 .\git-clone-resume.ps1 https://github.com/user/repo.git -DryRun
+
+# 强制 / 禁用全屏 TUI
+.\git-clone-resume.ps1 https://github.com/user/repo.git -Tui
+.\git-clone-resume.ps1 https://github.com/user/repo.git -NoTui
+
+# 从本机历史恢复最近一次未完成的克隆
+.\git-clone-resume.ps1 -ResumeLast
 ```
 
 完整帮助：`git-clone-resume.cmd -Help`
+
+### TUI 快捷键
+
+克隆过程中（底栏会随阶段切换提示）：
+
+| 键 | 作用 |
+| --- | --- |
+| `Q` / `Ctrl+C` | 当前 git 命令结束后停止；再按一次强制结束 |
+| `P` / `Esc` | 当前批次结束后暂停 |
+| `Space` | 从暂停恢复 |
+| `F` | 切换失败文件列表 |
+| `↑` `↓` / `j` `k` | 滚动活动日志 |
+| `End` | 跟随最新日志 |
+| `?` / `H` | 帮助 |
+| `Enter` | 结束页关闭 |
+
+向导里：`Enter` 编辑或开始，`Space` 切换开关，`←` `→` 改批次大小，`Tab` 最近任务，`Ctrl+V` 粘贴 URL，`Q` 退出。高亮某一选项时，底栏上一行会显示该选项的简短说明（Guide）。
+
+历史记录写在 `%LOCALAPPDATA%\git-clone-resume\history.json`。框线在中文控制台里若变宽，会自动改用 ASCII；也可设 `GCR_ASCII=1` 强制 ASCII。
 
 ## 工作原理
 
@@ -79,6 +119,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1 https
 - Windows 长路径、`http.version=HTTP/1.1`、低速断开、UTF-8 路径、`index.lock` 清理
 - 跳过 submodule gitlink；可用 `-Include` / `-Exclude` 过滤
 - Ctrl+C 或断电后重跑同一命令即可，不需要手动改文件列表
+- 交互式全屏 TUI：无参数向导、进度面板、暂停/停止、最近任务续传（`-NoTui` 可关闭）
 
 ## 注意事项
 
@@ -96,4 +137,3 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1 https
 | 0 | 全部完成或本来就已经齐 |
 | 1 | 有文件最终仍失败，或中途异常；可重跑续传 |
 | 2 | 参数错误 / 找不到 git |
-

@@ -49,6 +49,15 @@
 .PARAMETER DryRun
     只列出将要处理的文件，不 checkout。
 
+.PARAMETER Tui
+    强制进入全屏 TUI（交互向导 + 进度面板）。
+
+.PARAMETER NoTui
+    禁用 TUI，使用原来的纯日志输出（脚本/CI 推荐）。
+
+.PARAMETER ResumeLast
+    从本机历史记录里恢复最近一次未完成（或最近一次）克隆。
+
 .EXAMPLE
     .\git-clone-resume.ps1 https://github.com/chaihahaha/git-cheatsheet.git
 
@@ -92,6 +101,12 @@ param(
 
     [switch]$DryRun,
 
+    [switch]$Tui,
+
+    [switch]$NoTui,
+
+    [switch]$ResumeLast,
+
     [switch]$Help
 )
 
@@ -115,13 +130,49 @@ $script:RepoRoot = $null
 $script:LogFile = $null
 $script:GitExe = $null
 $script:StateDirName = "partial-resume"
+$script:GcrTuiWanted = $false
+$script:GcrExitCode = 0
+$script:GcrUserStop = $false
+
+$script:GcrTuiFile = Join-Path $PSScriptRoot "git-clone-resume.tui.ps1"
+if (-not $PSScriptRoot) {
+    $script:GcrTuiFile = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "git-clone-resume.tui.ps1"
+}
+if (Test-Path -LiteralPath $script:GcrTuiFile) {
+    . $script:GcrTuiFile
+} else {
+    function Test-GcrTuiActive { return $false }
+    function Test-GcrTuiAvailable { return $false }
+    function Test-GcrTuiQuit { return $false }
+    function Test-GcrTuiForceQuit { return $false }
+    function Invoke-GcrTuiTick { }
+    function Write-GcrNewline { Write-Host "" }
+    function Initialize-GcrTui { return $false }
+    function Close-GcrTui { }
+    function Set-GcrTuiPhase { }
+    function Set-GcrTuiRepo { }
+    function Update-GcrTuiProgress { }
+    function Add-GcrTuiLog { }
+    function Add-GcrTuiFailure { }
+    function Add-GcrGitOutput { }
+    function Receive-GcrGitBytes { }
+    function Wait-GcrTuiPaused { }
+    function Show-GcrTuiResult { }
+    function Save-GcrHistory { }
+}
 
 function Write-Log {
     param(
-        [Parameter(Mandatory = $true)][string]$Message,
-        [ValidateSet("INFO", "WARN", "ERROR", "OK", "STEP")]
+        $Message,
         [string]$Level = "INFO"
     )
+    if (@("INFO", "WARN", "ERROR", "OK", "STEP") -notcontains $Level) { $Level = "INFO" }
+    $text = ""
+    try {
+        if ($null -eq $Message) { $text = "" }
+        elseif ($Message -is [System.Array]) { $text = (@($Message | ForEach-Object { "$_" }) -join " ") }
+        else { $text = [string]$Message }
+    } catch { $text = "$Message" }
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $color = switch ($Level) {
         "INFO"  { "Gray" }
@@ -129,9 +180,17 @@ function Write-Log {
         "ERROR" { "Red" }
         "OK"    { "Green" }
         "STEP"  { "Cyan" }
+        default { "Gray" }
     }
-    $line = "[$ts][$Level] $Message"
-    Write-Host $line -ForegroundColor $color
+    $line = "[$ts][$Level] $text"
+    try {
+        if (Test-GcrTuiActive) {
+            Add-GcrTuiLog -Level $Level -Message $text
+            Invoke-GcrTuiTick
+        } else {
+            Write-Host $line -ForegroundColor $color
+        }
+    } catch { }
     if ($script:LogFile) {
         try {
             [System.IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine, $script:Utf8NoBom)
@@ -157,16 +216,19 @@ function Show-Usage {
     Write-Host "  -Verify                 Hash-check local files on resume"
     Write-Host "  -ForceRefetch           Always fetch the target ref"
     Write-Host "  -DryRun                 List files, do not checkout blobs"
+    Write-Host "  -Tui                    Force fullscreen TUI"
+    Write-Host "  -NoTui                  Disable TUI (script/CI mode)"
+    Write-Host "  -ResumeLast             Resume the latest history entry"
     Write-Host "  -Help                   Show this help"
     Write-Host ""
+    Write-Host "Interactive: run with no URL to open the TUI wizard."
     Write-Host "Resume: run the same command again. State is in .git/partial-resume/"
+    Write-Host "Keys: Q stop  P pause  F failures  ? help  Ctrl+C twice to kill git"
 }
 
-if ($Help -or [string]::IsNullOrWhiteSpace($RepoUrl)) {
+if ($Help) {
     Show-Usage
-    if ($Help) { exit 0 }
-    Write-Host "错误: 必须提供仓库 URL。" -ForegroundColor Red
-    exit 2
+    exit 0
 }
 
 function Get-RepoFolderName {
@@ -275,17 +337,57 @@ function Invoke-GitProcess {
     $proc.StartInfo = $psi
     $stdout = ""
     $stderr = ""
+    $script:GcrCurrentProc = $proc
     try {
         [void]$proc.Start()
         $proc.StandardInput.Close()
-        if (-not $InheritConsole) {
+        $waitSlice = 80
+        if (-not (Test-GcrTuiActive)) { $waitSlice = 500 }
+        $waited = 0
+        $hbSec = 2
+        $useStream = (Test-GcrTuiActive) -and (-not $InheritConsole)
+        $stdoutTask = $null
+        $stderrTask = $null
+        $outBuf = $null
+        $errBuf = $null
+        $outCarry = $null
+        $errCarry = $null
+        $outRead = $null
+        $errRead = $null
+        $stdoutSb = New-Object System.Text.StringBuilder
+        $stderrSb = New-Object System.Text.StringBuilder
+        if ($useStream) {
+            $outBuf = New-Object byte[] 4096
+            $errBuf = New-Object byte[] 4096
+            $outCarry = New-Object System.Text.StringBuilder
+            $errCarry = New-Object System.Text.StringBuilder
+            $outRead = $proc.StandardOutput.BaseStream.ReadAsync($outBuf, 0, $outBuf.Length)
+            $errRead = $proc.StandardError.BaseStream.ReadAsync($errBuf, 0, $errBuf.Length)
+        } elseif (-not $InheritConsole) {
             $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
             $stderrTask = $proc.StandardError.ReadToEndAsync()
         }
-        $waitSlice = 500
-        $waited = 0
-        $hbSec = 2
         while (-not $proc.HasExited) {
+            if ($useStream) {
+                if ($null -ne $outRead -and $outRead.IsCompleted) {
+                    $n = 0
+                    try { $n = [int]$outRead.Result } catch { $n = 0 }
+                    if ($n -gt 0) {
+                        $chunk = [System.Text.Encoding]::UTF8.GetString($outBuf, 0, $n)
+                        [void]$stdoutSb.Append($chunk)
+                        $outRead = $proc.StandardOutput.BaseStream.ReadAsync($outBuf, 0, $outBuf.Length)
+                    } else { $outRead = $null }
+                }
+                if ($null -ne $errRead -and $errRead.IsCompleted) {
+                    $n = 0
+                    try { $n = [int]$errRead.Result } catch { $n = 0 }
+                    if ($n -gt 0) {
+                        [void]$stderrSb.Append([System.Text.Encoding]::UTF8.GetString($errBuf, 0, $n))
+                        Receive-GcrGitBytes -Buffer $errBuf -Count $n -Carry $errCarry -IsStdErr
+                        $errRead = $proc.StandardError.BaseStream.ReadAsync($errBuf, 0, $errBuf.Length)
+                    } else { $errRead = $null }
+                }
+            }
             if (-not $proc.WaitForExit($waitSlice)) {
                 $waited += $waitSlice
                 if ($TimeoutMs -gt 0 -and $waited -ge $TimeoutMs) {
@@ -294,19 +396,52 @@ function Invoke-GitProcess {
                 }
                 if ($Heartbeat -and ($waited % ($hbSec * 1000) -lt $waitSlice)) {
                     $sec = [int]($waited / 1000)
-                    Write-Host ("`r[WAIT] " + $Heartbeat + " ... " + $sec + "s    ") -NoNewline
+                    if (Test-GcrTuiActive) {
+                        Set-GcrTuiPhase -Detail ($Heartbeat + " ... " + $sec + "s")
+                    } else {
+                        Write-Host ("`r[WAIT] " + $Heartbeat + " ... " + $sec + "s    ") -NoNewline
+                    }
+                }
+            }
+            if (Test-GcrTuiActive) {
+                Invoke-GcrTuiTick
+                if (Test-GcrTuiForceQuit) {
+                    try { $proc.Kill() } catch { }
+                    $script:GcrUserStop = $true
+                    throw "已由用户停止。"
                 }
             }
         }
-        if ($Heartbeat) { Write-Host "" }
-        if (-not $InheritConsole) {
+        if ($Heartbeat -and -not (Test-GcrTuiActive)) { Write-Host "" }
+        if ($useStream) {
+            if ($null -ne $outRead) {
+                try {
+                    $n = [int]$outRead.Result
+                    if ($n -gt 0) { [void]$stdoutSb.Append([System.Text.Encoding]::UTF8.GetString($outBuf, 0, $n)) }
+                } catch { }
+            }
+            if ($null -ne $errRead) {
+                try {
+                    $n = [int]$errRead.Result
+                    if ($n -gt 0) {
+                        [void]$stderrSb.Append([System.Text.Encoding]::UTF8.GetString($errBuf, 0, $n))
+                        Receive-GcrGitBytes -Buffer $errBuf -Count $n -Carry $errCarry -IsStdErr
+                    }
+                } catch { }
+            }
+            if ($errCarry -and $errCarry.Length -gt 0) { Add-GcrGitOutput -Text $errCarry.ToString() }
+            $stdout = $stdoutSb.ToString()
+            $stderr = $stderrSb.ToString()
+        } elseif (-not $InheritConsole) {
             [void]$stdoutTask.Wait()
             [void]$stderrTask.Wait()
             $stdout = $stdoutTask.Result
             $stderr = $stderrTask.Result
         }
+        if ($script:GcrUserStop) { throw "已由用户停止。" }
         $code = $proc.ExitCode
     } finally {
+        $script:GcrCurrentProc = $null
         $proc.Dispose()
     }
 
@@ -372,12 +507,14 @@ function Invoke-GitRetry {
         $attempt++
         try {
             $r = Invoke-GitProcess -GitArgs $GitArgs -WorkDir $WorkDir -TimeoutMs $TimeoutMs -ExpectFail -InheritConsole:$InheritConsole -Heartbeat $Heartbeat
+            if ($script:GcrUserStop) { throw "已由用户停止。" }
             if ($r.ExitCode -eq 0) { return $r }
             $lastError = "exit " + $r.ExitCode
             $tail = $r.StdErr
             if ([string]::IsNullOrWhiteSpace($tail)) { $tail = $r.StdOut }
             if (-not [string]::IsNullOrWhiteSpace($tail)) { $lastError = $lastError + " : " + $tail.Trim() }
         } catch {
+            if ($script:GcrUserStop) { throw }
             $lastError = $_.Exception.Message
         }
         if ($attempt -ge $limit) { break }
@@ -796,17 +933,149 @@ function Write-DownloadProgress {
     $out = $line
     if ($out.Length -lt $width) { $out = $out.PadRight($width) }
     elseif ($out.Length -gt $width) { $out = $out.Substring(0, $width) }
-    Write-Host ("`r" + $out) -NoNewline
-    Write-Progress -Activity "git-clone-resume" -Status $line -PercentComplete ([Math]::Min(100, [int]$pct))
+    if (Test-GcrTuiActive) {
+        Update-GcrTuiProgress -OkCount $OkCount -TotalCount $TotalCount -FailCount $FailCount -DoneBytes $DoneBytes -Rate $rate -Eta $eta -CurrentFile $CurrentFile
+        Invoke-GcrTuiTick
+    } else {
+        Write-Host ("`r" + $out) -NoNewline
+        Write-Progress -Activity "git-clone-resume" -Status $line -PercentComplete ([Math]::Min(100, [int]$pct))
+    }
+}
+
+function Assert-GcrContinue {
+    if (-not (Get-Command Test-GcrTuiActive -ErrorAction SilentlyContinue)) { return }
+    if (-not (Test-GcrTuiActive)) { return }
+    Invoke-GcrTuiTick
+    Wait-GcrTuiPaused
+    Invoke-GcrTuiTick
+    if (Test-GcrTuiQuit) {
+        $script:GcrUserStop = $true
+        throw "已由用户停止。再次运行同一命令即可续传。"
+    }
+}
+
+$script:GcrInteractive = $false
+try { $script:GcrInteractive = [Environment]::UserInteractive } catch { }
+if ($NoTui) {
+    $script:GcrTuiWanted = $false
+} elseif ($Tui) {
+    $script:GcrTuiWanted = $true
+} elseif ($script:GcrInteractive -and (Get-Command Test-GcrTuiAvailable -ErrorAction SilentlyContinue) -and (Test-GcrTuiAvailable)) {
+    $script:GcrTuiWanted = $true
+}
+
+if ($ResumeLast) {
+    if (-not (Get-Command Get-GcrHistoryLast -ErrorAction SilentlyContinue)) {
+        Write-Host "错误: 无法读取历史记录。" -ForegroundColor Red
+        exit 2
+    }
+    $last = Get-GcrHistoryLast
+    if ($null -eq $last) {
+        Write-Host "错误: 没有可恢复的历史记录。请先启动过一次克隆。" -ForegroundColor Red
+        exit 2
+    }
+    if ([string]::IsNullOrWhiteSpace($RepoUrl) -and $last.url) { $RepoUrl = [string]$last.url }
+    if ([string]::IsNullOrWhiteSpace($OutDir) -and $last.outDir) { $OutDir = [string]$last.outDir }
+    if (($Ref -eq "HEAD" -or [string]::IsNullOrWhiteSpace($Ref)) -and $last.ref) { $Ref = [string]$last.ref }
+}
+
+if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
+    if ($NoTui -or -not $script:GcrInteractive) {
+        Show-Usage
+        Write-Host "错误: 必须提供仓库 URL。" -ForegroundColor Red
+        exit 2
+    }
+    $defaults = @{
+        RepoUrl      = $RepoUrl
+        OutDir       = $OutDir
+        Ref          = $Ref
+        BatchSize    = $BatchSize
+        MaxRetries   = $MaxRetries
+        Include      = $Include
+        Exclude      = $Exclude
+        Verify       = [bool]$Verify
+        ForceRefetch = [bool]$ForceRefetch
+        DryRun       = [bool]$DryRun
+    }
+    if ($PSBoundParameters.ContainsKey("Depth")) { $defaults["Depth"] = $Depth }
+    if (-not (Get-Command Show-GcrInteractiveSetup -ErrorAction SilentlyContinue)) {
+        Show-Usage
+        Write-Host "错误: 必须提供仓库 URL。" -ForegroundColor Red
+        exit 2
+    }
+    $wiz = $null
+    try {
+        $wiz = Show-GcrInteractiveSetup -Defaults $defaults
+        if (Get-Command ConvertFrom-GcrWizardOutput -ErrorAction SilentlyContinue) {
+            $unwrapped = ConvertFrom-GcrWizardOutput $wiz
+            if ($null -ne $unwrapped) { $wiz = $unwrapped }
+        }
+    } catch {
+        if (Get-Command Close-GcrTui -ErrorAction SilentlyContinue) { Close-GcrTui }
+        Write-Host ("向导失败: " + $_.Exception.Message) -ForegroundColor Red
+        exit 1
+    }
+    if ($null -eq $wiz) {
+        if (Get-Command Close-GcrTui -ErrorAction SilentlyContinue) { Close-GcrTui }
+        exit 0
+    }
+    try {
+        $RepoUrl = [string]$wiz.RepoUrl
+        if ($wiz.OutDir) { $OutDir = [string]$wiz.OutDir }
+        if ($wiz.Ref) { $Ref = [string]$wiz.Ref }
+        if ($wiz.BatchSize) { $BatchSize = [int]$wiz.BatchSize }
+        if ($wiz.MaxRetries) { $MaxRetries = [int]$wiz.MaxRetries }
+        if ($null -ne $wiz.Include) { $Include = @($wiz.Include | Where-Object { $_ }) }
+        if ($null -ne $wiz.Exclude) { $Exclude = @($wiz.Exclude | Where-Object { $_ }) }
+        $Verify = [bool]$wiz.Verify
+        $ForceRefetch = [bool]$wiz.ForceRefetch
+        $DryRun = [bool]$wiz.DryRun
+        if ($null -ne $wiz.Depth -and [string]$wiz.Depth -ne "") {
+            $Depth = [int]$wiz.Depth
+            $PSBoundParameters["Depth"] = $Depth
+        }
+    } catch {
+        if (Test-GcrTuiActive) {
+            Show-GcrTuiResult -Title "无法开始克隆" -Body @($_.Exception.Message) -Kind error
+            Close-GcrTui
+        } else {
+            Write-Host ("无法开始克隆: " + $_.Exception.Message) -ForegroundColor Red
+        }
+        exit 1
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
+    if (Get-Command Close-GcrTui -ErrorAction SilentlyContinue) { Close-GcrTui }
+    Show-Usage
+    Write-Host "错误: 必须提供仓库 URL。" -ForegroundColor Red
+    exit 2
+}
+
+if ($script:GcrTuiWanted -and (Get-Command Initialize-GcrTui -ErrorAction SilentlyContinue)) {
+    if (-not (Test-GcrTuiActive)) { [void](Initialize-GcrTui) }
+    if ($Tui -and -not (Test-GcrTuiActive)) {
+        Write-Host "当前终端无法进入全屏 TUI，改用日志模式。Windows Terminal 下再试，或去掉 -Tui。" -ForegroundColor Yellow
+    }
 }
 
 try {
-    Test-GitAvailable
-    $script:GitExe = Get-GitExePath
-
     if (-not $OutDir) { $OutDir = Get-RepoFolderName -Url $RepoUrl }
     $repoRoot = Convert-ToFullPath -Path $OutDir
     $script:RepoRoot = $repoRoot
+
+    if (Test-GcrTuiActive) {
+        $resumeHint = Test-Path -LiteralPath (Join-Path $repoRoot ".git\$($script:StateDirName)\meta.txt")
+        Set-GcrTuiRepo -Url $RepoUrl -OutDir $repoRoot -Ref $Ref -Resume:$resumeHint
+        Set-GcrTuiPhase -Name "init" -Detail ""
+        if (Get-Command Save-GcrHistory -ErrorAction SilentlyContinue) {
+            Save-GcrHistory -Url $RepoUrl -OutDir $repoRoot -Ref $Ref -Status "running"
+        }
+        Invoke-GcrTuiTick -Force
+    }
+
+    Test-GitAvailable
+    $script:GitExe = Get-GitExePath
 
     Write-Log "仓库: $RepoUrl" "STEP"
     Write-Log "目录: $repoRoot" "INFO"
@@ -855,7 +1124,10 @@ try {
 
     if ($needFetch) {
         Write-Log "fetch 元数据: git fetch --filter=blob:none origin $Ref" "STEP"
-        Invoke-GitRetry -What "git fetch" -WorkDir $repoRoot -GitArgs $fetchArgs -InheritConsole | Out-Null
+        Set-GcrTuiPhase -Name "fetch" -Detail ("origin " + $Ref)
+        Assert-GcrContinue
+        $inheritFetch = -not (Test-GcrTuiActive)
+        Invoke-GitRetry -What "git fetch" -WorkDir $repoRoot -GitArgs $fetchArgs -InheritConsole:$inheritFetch | Out-Null
         $rev = Invoke-GitRetry -What "rev-parse FETCH_HEAD" -WorkDir $repoRoot -GitArgs @("rev-parse", "FETCH_HEAD")
         $pinnedSha = $rev.StdOut.Trim()
         if ([string]::IsNullOrWhiteSpace($pinnedSha)) {
@@ -869,6 +1141,7 @@ try {
     }
     Set-DetachedHead -RepoRoot $repoRoot -Sha $pinnedSha
     Write-Log "目标 commit: $pinnedSha" "OK"
+    Set-GcrTuiRepo -Commit $pinnedSha
 
     Write-Meta -MetaPath $metaPath -Map @{
         url      = $RepoUrl
@@ -880,6 +1153,8 @@ try {
     }
 
     Write-Log "枚举文件树 git ls-tree -r $pinnedSha" "STEP"
+    Set-GcrTuiPhase -Name "list" -Detail $pinnedSha
+    Assert-GcrContinue
     $all = Get-TreeEntries -RepoRoot $repoRoot -Sha $pinnedSha
     if ($null -eq $all) { $all = New-Object System.Collections.Generic.List[object] }
     Write-Log ("树中条目: " + $all.Count) "INFO"
@@ -911,160 +1186,236 @@ try {
     }
     Save-TextFile -Path $listPath -Content $tsv.ToString()
 
+    $okCount = 0
+    $failCount = 0
+    $totalCount = $filtered.Count
+    $doneBytes = 0L
+    $skipDownload = $false
+    $resultKind = "done"
+    $resultTitle = ""
+    $resultBody = New-Object System.Collections.Generic.List[string]
+
     if ($DryRun) {
         Write-Log "DryRun 结束，清单: $listPath" "OK"
         $nshow = [Math]::Min(30, $filtered.Count)
         for ($i = 0; $i -lt $nshow; $i++) {
             $e = $filtered[$i]
-            Write-Host ("  " + $e.Path)
+            if (Test-GcrTuiActive) { Add-GcrTuiLog -Level "INFO" -Message $e.Path }
+            else { Write-Host ("  " + $e.Path) }
         }
         if ($filtered.Count -gt 30) {
-            Write-Host ("  ... 另有 {0} 个文件" -f ($filtered.Count - 30))
+            $more = ("  ... 另有 {0} 个文件" -f ($filtered.Count - 30))
+            if (Test-GcrTuiActive) { Add-GcrTuiLog -Level "INFO" -Message $more.Trim() }
+            else { Write-Host $more }
         }
-        exit 0
+        $script:GcrExitCode = 0
+        $skipDownload = $true
+        $resultTitle = "DryRun 完成"
+        [void]$resultBody.Add(("清单文件: " + $listPath))
+        [void]$resultBody.Add(("文件数: " + $filtered.Count))
+        [void]$resultBody.Add("未下载 blob。去掉 -DryRun 后开始/继续克隆。")
     }
 
-    $doneSet = Load-DoneSet -DonePath $donePath
-    $pending = New-Object System.Collections.Generic.List[object]
-    $skippedDone = 0
-    $skippedExist = 0
-    $reverify = [bool]$Verify
-    $scanTotal = $filtered.Count
-    $scanIndex = 0
-    $scanStarted = Get-Date
+    if (-not $skipDownload) {
+        Set-GcrTuiPhase -Name "scan" -Detail "检查工作区已有文件"
+        $doneSet = Load-DoneSet -DonePath $donePath
+        $pending = New-Object System.Collections.Generic.List[object]
+        $skippedDone = 0
+        $skippedExist = 0
+        $reverify = [bool]$Verify
+        $scanTotal = $filtered.Count
+        $scanIndex = 0
+        $scanStarted = Get-Date
 
-    foreach ($e in $filtered) {
-        $scanIndex++
-        if (($scanIndex % 200) -eq 0 -or $scanIndex -eq $scanTotal) {
-            Write-DownloadProgress -OkCount $scanIndex -TotalCount $scanTotal -FailCount 0 -DoneBytes 0L -Elapsed ((Get-Date) - $scanStarted) -DoneThisRun $scanIndex -CurrentFile ("scan " + $e.Path)
-        }
-        $complete = Test-FileComplete -RepoRoot $repoRoot -Entry $e -HashVerify:$reverify
-        if ($complete) {
+        foreach ($e in $filtered) {
+            $scanIndex++
+            if (($scanIndex % 200) -eq 0 -or $scanIndex -eq $scanTotal) {
+                Write-DownloadProgress -OkCount $scanIndex -TotalCount $scanTotal -FailCount 0 -DoneBytes 0L -Elapsed ((Get-Date) - $scanStarted) -DoneThisRun $scanIndex -CurrentFile ("scan " + $e.Path)
+                Assert-GcrContinue
+            }
+            $complete = Test-FileComplete -RepoRoot $repoRoot -Entry $e -HashVerify:$reverify
+            if ($complete) {
+                if ($doneSet.Contains($e.Path)) {
+                    $skippedDone++
+                } else {
+                    [void]$doneSet.Add($e.Path)
+                    Add-DonePaths -DonePath $donePath -Paths @($e.Path)
+                    $skippedExist++
+                }
+                continue
+            }
             if ($doneSet.Contains($e.Path)) {
-                $skippedDone++
-            } else {
-                [void]$doneSet.Add($e.Path)
-                Add-DonePaths -DonePath $donePath -Paths @($e.Path)
-                $skippedExist++
+                [void]$doneSet.Remove($e.Path)
             }
-            continue
+            [void]$pending.Add($e)
         }
-        if ($doneSet.Contains($e.Path)) {
-            [void]$doneSet.Remove($e.Path)
-        }
-        [void]$pending.Add($e)
-    }
-    Write-Host ""
+        Write-GcrNewline
 
-    Write-Log ("进度: 已记录 " + $skippedDone + " ，工作区已存在 " + $skippedExist + " ，剩余 " + $pending.Count) "INFO"
+        Write-Log ("进度: 已记录 " + $skippedDone + " ，工作区已存在 " + $skippedExist + " ，剩余 " + $pending.Count) "INFO"
 
-    if ($pending.Count -eq 0) {
-        Write-Log "全部文件已就绪。" "OK"
-        Write-Log "工作区: $repoRoot" "OK"
-        exit 0
-    }
-
-    $batches = Split-Batches -Items $pending.ToArray() -MaxCount $BatchSize -MaxChars $MaxArgChars
-    Write-Log ("分 " + $batches.Count + " 批下载，每批最多 " + $BatchSize + " 个文件") "STEP"
-
-    $started = Get-Date
-    $okCount = $skippedDone + $skippedExist
-    $failCount = 0
-    $doneBytes = 0L
-    foreach ($e in $filtered) {
-        if ($doneSet.Contains($e.Path)) { $doneBytes += (Get-WorktreeBytes -RepoRoot $repoRoot -RelPath $e.Path) }
-    }
-    $totalCount = $filtered.Count
-    $processedThisRun = 0
-    Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount 0 -DoneBytes $doneBytes -Elapsed ([TimeSpan]::Zero) -DoneThisRun 0 -CurrentFile "starting download"
-
-    $batchIndex = 0
-    foreach ($batch in $batches) {
-        $batchIndex++
-        $okThis = New-Object System.Collections.Generic.List[object]
-        $badThis = New-Object System.Collections.Generic.List[object]
-        $preview = $batch[0].Path
-        Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount $failCount -DoneBytes $doneBytes -Elapsed ((Get-Date) - $started) -DoneThisRun $processedThisRun -CurrentFile $preview
-
-        try {
-            Invoke-CheckoutBatch -RepoRoot $repoRoot -Sha $pinnedSha -Batch $batch
-            $result = Confirm-BatchFiles -RepoRoot $repoRoot -Batch $batch
-            foreach ($x in $result.Ok) { [void]$okThis.Add($x) }
-            foreach ($x in $result.Bad) { [void]$badThis.Add($x) }
-        } catch {
-            $nBatch = @($batch).Count
-            if ($nBatch -gt 1) {
-                Write-Log ("批次 " + $batchIndex + "/" + $batches.Count + " 失败（" + $nBatch + " 个文件），立即拆成单文件，不再整批重试: " + $_.Exception.Message) "WARN"
-            } else {
-                Write-Log ("单文件失败: " + $_.Exception.Message) "WARN"
-            }
-            foreach ($x in $batch) { [void]$badThis.Add($x) }
+        $okCount = $skippedDone + $skippedExist
+        $totalCount = $filtered.Count
+        foreach ($e in $filtered) {
+            if ($doneSet.Contains($e.Path)) { $doneBytes += (Get-WorktreeBytes -RepoRoot $repoRoot -RelPath $e.Path) }
         }
 
-        $retry = New-Object System.Collections.Generic.List[object]
-        foreach ($e in $badThis) { [void]$retry.Add($e) }
-        foreach ($e in $retry) {
-            $oneOk = $false
-            $one = New-Object System.Collections.Generic.List[object]
-            [void]$one.Add($e)
+        if ($pending.Count -eq 0) {
+            Write-Log "全部文件已就绪。" "OK"
+            Write-Log "工作区: $repoRoot" "OK"
+            $script:GcrExitCode = 0
+            $skipDownload = $true
+            $resultTitle = "全部文件已就绪"
+            [void]$resultBody.Add(("工作区: " + $repoRoot))
+            [void]$resultBody.Add(("文件: {0}/{1}" -f $okCount, $totalCount))
+        }
+    }
+
+    if (-not $skipDownload) {
+        $batches = Split-Batches -Items $pending.ToArray() -MaxCount $BatchSize -MaxChars $MaxArgChars
+        Write-Log ("分 " + $batches.Count + " 批下载，每批最多 " + $BatchSize + " 个文件") "STEP"
+        Set-GcrTuiPhase -Name "download" -Detail ("batch 1/" + $batches.Count)
+        Assert-GcrContinue
+
+        $started = Get-Date
+        $failCount = 0
+        $processedThisRun = 0
+        Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount 0 -DoneBytes $doneBytes -Elapsed ([TimeSpan]::Zero) -DoneThisRun 0 -CurrentFile "starting download"
+
+        $batchIndex = 0
+        foreach ($batch in $batches) {
+            Assert-GcrContinue
+            $batchIndex++
+            Set-GcrTuiPhase -Name "download" -Detail ("batch " + $batchIndex + "/" + $batches.Count)
+            $okThis = New-Object System.Collections.Generic.List[object]
+            $badThis = New-Object System.Collections.Generic.List[object]
+            $preview = $batch[0].Path
+            Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount $failCount -DoneBytes $doneBytes -Elapsed ((Get-Date) - $started) -DoneThisRun $processedThisRun -CurrentFile $preview
+
             try {
-                Invoke-CheckoutBatch -RepoRoot $repoRoot -Sha $pinnedSha -Batch $one
-                if (Test-FileComplete -RepoRoot $repoRoot -Entry $e) { $oneOk = $true }
+                Invoke-CheckoutBatch -RepoRoot $repoRoot -Sha $pinnedSha -Batch $batch
+                $result = Confirm-BatchFiles -RepoRoot $repoRoot -Batch $batch
+                foreach ($x in $result.Ok) { [void]$okThis.Add($x) }
+                foreach ($x in $result.Bad) { [void]$badThis.Add($x) }
             } catch {
-                Add-FailedPath -FailedPath $failedPath -RelPath $e.Path -Reason $_.Exception.Message
+                if ($script:GcrUserStop) { throw }
+                $nBatch = @($batch).Count
+                if ($nBatch -gt 1) {
+                    Write-Log ("批次 " + $batchIndex + "/" + $batches.Count + " 失败（" + $nBatch + " 个文件），立即拆成单文件，不再整批重试: " + $_.Exception.Message) "WARN"
+                } else {
+                    Write-Log ("单文件失败: " + $_.Exception.Message) "WARN"
+                }
+                foreach ($x in $batch) { [void]$badThis.Add($x) }
             }
-            if ($oneOk) {
-                [void]$okThis.Add($e)
-            } else {
-                $failCount++
-                $fullFail = Get-WorktreePath -Root $repoRoot -Rel $e.Path
-                $why = "no worktree file"
-                if (Test-Path -LiteralPath $fullFail) { $why = "worktree file present but still incomplete" }
-                Write-Log ("仍失败: " + $e.Path + " (" + $why + ")") "ERROR"
+
+            $retry = New-Object System.Collections.Generic.List[object]
+            foreach ($e in $badThis) { [void]$retry.Add($e) }
+            foreach ($e in $retry) {
+                Assert-GcrContinue
+                $oneOk = $false
+                $one = New-Object System.Collections.Generic.List[object]
+                [void]$one.Add($e)
+                try {
+                    Invoke-CheckoutBatch -RepoRoot $repoRoot -Sha $pinnedSha -Batch $one
+                    if (Test-FileComplete -RepoRoot $repoRoot -Entry $e) { $oneOk = $true }
+                } catch {
+                    if ($script:GcrUserStop) { throw }
+                    Add-FailedPath -FailedPath $failedPath -RelPath $e.Path -Reason $_.Exception.Message
+                }
+                if ($oneOk) {
+                    [void]$okThis.Add($e)
+                } else {
+                    $failCount++
+                    Add-GcrTuiFailure -Path $e.Path
+                    $fullFail = Get-WorktreePath -Root $repoRoot -Rel $e.Path
+                    $why = "no worktree file"
+                    if (Test-Path -LiteralPath $fullFail) { $why = "worktree file present but still incomplete" }
+                    Write-Log ("仍失败: " + $e.Path + " (" + $why + ")") "ERROR"
+                }
+            }
+
+            $okPaths = New-Object System.Collections.Generic.List[string]
+            foreach ($x in $okThis) { [void]$okPaths.Add([string]$x.Path) }
+            if ($okPaths.Count -gt 0) {
+                Add-DonePaths -DonePath $donePath -Paths $okPaths.ToArray()
+                foreach ($p in $okPaths) { [void]$doneSet.Add($p) }
+            }
+
+            $processedThisRun += $okThis.Count
+            $okCount += $okThis.Count
+            foreach ($e in $okThis) { $doneBytes += (Get-WorktreeBytes -RepoRoot $repoRoot -RelPath $e.Path) }
+
+            $lastName = $batch[$batch.Count - 1].Path
+            Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount $failCount -DoneBytes $doneBytes -Elapsed ((Get-Date) - $started) -DoneThisRun $processedThisRun -CurrentFile $lastName
+            if (($batchIndex % 20) -eq 0 -or $okCount -eq $totalCount) {
+                $pctNow = 0.0
+                if ($totalCount -gt 0) { $pctNow = 100.0 * $okCount / $totalCount }
+                Write-GcrNewline
+                Write-Log (("checkpoint {0}/{1} {2:N1}%  fail {3}  {4}" -f $okCount, $totalCount, $pctNow, $failCount, (Format-Bytes $doneBytes))) "INFO"
             }
         }
 
-        $okPaths = New-Object System.Collections.Generic.List[string]
-        foreach ($x in $okThis) { [void]$okPaths.Add([string]$x.Path) }
-        if ($okPaths.Count -gt 0) {
-            Add-DonePaths -DonePath $donePath -Paths $okPaths.ToArray()
-            foreach ($p in $okPaths) { [void]$doneSet.Add($p) }
+        Write-GcrNewline
+        if (-not (Test-GcrTuiActive)) {
+            Write-Progress -Activity "git-clone-resume" -Completed
         }
-
-        $processedThisRun += $okThis.Count
-        $okCount += $okThis.Count
-        foreach ($e in $okThis) { $doneBytes += (Get-WorktreeBytes -RepoRoot $repoRoot -RelPath $e.Path) }
-
-        $lastName = $batch[$batch.Count - 1].Path
-        Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount $failCount -DoneBytes $doneBytes -Elapsed ((Get-Date) - $started) -DoneThisRun $processedThisRun -CurrentFile $lastName
-        if (($batchIndex % 20) -eq 0 -or $okCount -eq $totalCount) {
-            $pctNow = 0.0
-            if ($totalCount -gt 0) { $pctNow = 100.0 * $okCount / $totalCount }
-            Write-Host ""
-            Write-Log (("checkpoint {0}/{1} {2:N1}%  fail {3}  {4}" -f $okCount, $totalCount, $pctNow, $failCount, (Format-Bytes $doneBytes))) "INFO"
+        Set-GcrTuiPhase -Name "repair" -Detail "git index"
+        Repair-GitIndex -RepoRoot $repoRoot -Sha $pinnedSha
+        $elapsed = (Get-Date) - $started
+        $elapsedText = "{0:00}:{1:00}:{2:00}" -f [int]$elapsed.TotalHours, $elapsed.Minutes, $elapsed.Seconds
+        Write-Log ("完成: 成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText) "OK"
+        Write-Log "工作区: $repoRoot" "OK"
+        [void]$resultBody.Add(("工作区: " + $repoRoot))
+        [void]$resultBody.Add(("成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText))
+        if ($failCount -gt 0) {
+            Write-Log "失败列表: $failedPath  （再次运行本脚本会重试未完成文件）" "WARN"
+            [void]$resultBody.Add(("失败列表: " + $failedPath))
+            [void]$resultBody.Add("再次运行同一命令会重试未完成文件。")
+            $script:GcrExitCode = 1
+            $resultKind = "error"
+            $resultTitle = "部分文件失败"
+        } else {
+            $script:GcrExitCode = 0
+            $resultTitle = "克隆完成"
         }
     }
 
-    Write-Host ""
-    Write-Progress -Activity "git-clone-resume" -Completed
-    Repair-GitIndex -RepoRoot $repoRoot -Sha $pinnedSha
-    $elapsed = (Get-Date) - $started
-    $elapsedText = "{0:00}:{1:00}:{2:00}" -f [int]$elapsed.TotalHours, $elapsed.Minutes, $elapsed.Seconds
-    Write-Log ("完成: 成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText) "OK"
-    Write-Log "工作区: $repoRoot" "OK"
-    if ($failCount -gt 0) {
-        Write-Log "失败列表: $failedPath  （再次运行本脚本会重试未完成文件）" "WARN"
-        exit 1
+    if (Get-Command Save-GcrHistory -ErrorAction SilentlyContinue) {
+        $histStatus = "complete"
+        if ($script:GcrExitCode -ne 0) { $histStatus = "failed" }
+        if ($DryRun) { $histStatus = "dryrun" }
+        Save-GcrHistory -Url $RepoUrl -OutDir $repoRoot -Ref $Ref -Commit $pinnedSha -Status $histStatus -Ok $okCount -Total $totalCount -Fail $failCount
     }
-    exit 0
+    if (Test-GcrTuiActive) {
+        if (-not $resultTitle) { $resultTitle = "完成" }
+        Show-GcrTuiResult -Title $resultTitle -Body $resultBody.ToArray() -Kind $resultKind
+    }
 }
 catch {
-    $err = $_.Exception.Message
+    $err = ""
+    try { $err = [string]$_.Exception.Message } catch { }
+    if (-not $err) { try { $err = [string]$_ } catch { $err = "unknown error" } }
     Write-Log $err "ERROR"
-    if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace "ERROR" }
+    if ($_.ScriptStackTrace -and -not $script:GcrUserStop) { Write-Log ([string]$_.ScriptStackTrace) "ERROR" }
     if ($script:RepoRoot) {
         Write-Log ("中断后续传: 重新执行同一命令即可。仓库目录: " + $script:RepoRoot) "WARN"
     }
-    exit 1
+    if (Get-Command Save-GcrHistory -ErrorAction SilentlyContinue -and $script:RepoRoot) {
+        $st = "failed"
+        if ($script:GcrUserStop) { $st = "partial" }
+        Save-GcrHistory -Url $RepoUrl -OutDir $script:RepoRoot -Ref $Ref -Status $st
+    }
+    if (Test-GcrTuiActive) {
+        $body = @($err)
+        if ($script:RepoRoot) { $body += ("仓库目录: " + $script:RepoRoot) }
+        $body += "再次运行同一命令即可续传。"
+        $title = $(if ($script:GcrUserStop) { "已停止" } else { "出错" })
+        Show-GcrTuiResult -Title $title -Body $body -Kind "error"
+    }
+    $script:GcrExitCode = 1
 }
+finally {
+    if (Get-Command Close-GcrTui -ErrorAction SilentlyContinue) { Close-GcrTui }
+}
+
+exit $script:GcrExitCode
 
