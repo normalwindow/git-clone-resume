@@ -1,0 +1,30 @@
+{
+  "version": "0.1.0",
+  "description": "Resume-friendly partial clone tool for Windows",
+  "homepage": "https://github.com/normalwindow/git-clone-resume",
+  "url": "https://github.com/normalwindow/git-clone-resume/releases/download/v0.1.0/git-clone-resume-0.1.0.zip",
+  "hash": "a91d075ac4696853ec373af48b92a94292f35deabc16205b20ca455a5fa23945",
+  "depends": [
+    "git"
+  ],
+  "bin": [
+    [
+      "gcr.cmd",
+      "gcr"
+    ],
+    [
+      "git-clone-resume.cmd",
+      "git-clone-resume"
+    ]
+  ],
+  "checkver": {
+    "github": "https://github.com/normalwindow/git-clone-resume"
+  },
+  "autoupdate": {
+    "url": "https://github.com/normalwindow/git-clone-resume/releases/download/v$version/git-clone-resume-$version.zip",
+    "hash": {
+      "url": "$url.sha256",
+      "regex": "([a-f0-9]{64})"
+    }
+  }
+}

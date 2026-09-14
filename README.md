@@ -40,7 +40,13 @@ gcr https://github.com/user/repo.git -Ref main -OutDir D:\src\repo
 
 后续发布渠道会复用 GitHub Release 中的同一 ZIP 和 SHA256 校验值：
 
-- Scoop：安装后直接提供 `gcr` 命令。
+- Scoop：执行下面的命令后直接提供 `gcr` 命令。
+
+  ```powershell
+  scoop bucket add git-clone-resume https://github.com/normalwindow/git-clone-resume
+  scoop install git-clone-resume
+  ```
+
 - winget：用于系统级安装、升级和卸载。
 - npm：执行 `npm install -g git-clone-resume` 后提供 `gcr` 命令，但仍需要 Git for Windows 和 PowerShell。
 
