@@ -150,7 +150,7 @@ function Convert-GcrText {
         @("当前终端无法进入全屏 TUI，改用日志模式。Windows Terminal 下再试，或去掉 -Tui。", "This terminal cannot enter fullscreen TUI; using log mode. Try Windows Terminal or remove -Tui."),
         @("已由用户停止。", "Stopped by user."), @("再次运行同一命令即可续传。", "Run the same command again to resume."),
         @("使用 ", "Using "), @("仓库:", "Repository:"), @("目录:", "Directory:"), @("引用:", "Ref:"),
-        @("语言", "Language"), @("中文", "Chinese"), @("英文", "English"), @("开", "On"), @("关", "Off"),
+        @("语言", "Language"), @("中文", "Chinese"), @("英文", "English"),
         @("目标 commit:", "Target commit:"), @("fetch 元数据:", "Fetching metadata:"), @("枚举文件树", "Enumerating file tree"),
         @("树中条目:", "Tree entries:"), @("待处理文件:", "Pending files:"), @("工作区:", "Workspace:"),
         @("全部文件已就绪。", "All files are ready."), @("完成", "Complete"), @("克隆完成", "Clone complete"),
@@ -184,6 +184,24 @@ function Convert-GcrText {
         @("语言", "Language"), @("中文", "Chinese"), @("英文", "English")
         ,@(" 仓库  ", " Repository  "), @(" 目录  ", " Directory  "), @(" 引用  ", " Ref  "), @(" 阶段  ", " Phase  "), @(" 当前  ", " Current  "),
         @("键盘", "Keyboard"), @("暂无失败文件。", "No failed files."), @("停止", "stop"), @("暂停", "pause"), @("帮助", "help"), @("日志", "log")
+        ,@("仓库 URL", "Repository URL"), @("本地目录", "Local directory"), @("分支/标签", "Branch/tag"), @("每批文件", "Files per batch"),
+        @("重试次数", "Retries"), @("只含路径", "Include paths"), @("排除路径", "Exclude paths"), @("浅克隆深度", "Clone depth"),
+        @("哈希校验", "Hash verification"), @("强制 refetch", "Force refetch"), @("开始克隆", "Start clone"),
+        @("(自动)", "(auto)"), @("(全部)", "(all)"), @("(无)", "(none)"), @("(完整历史)", "(full history)"),
+        @("强制重新 fetch 目标 ref。换分支或更新到最新 commit 时打开。Space 开关。", "Force-fetch the target ref. Enable when changing branches or updating to the latest commit. Space toggles."),
+        @("只列出将要处理的文件，不下载 blob。适合先看清单。Space 开关。", "List files without downloading blobs. Useful for previewing the file list. Space toggles."),
+        @("按上面的设置开始或继续克隆。Enter 启动。中断后重跑即可续传。", "Start or resume with the settings above. Press Enter to begin; rerun after interruption."),
+        @("Enter 编辑/开始", "Enter edit/start"), @("Space 开关", "Space toggle"), @("←→ 改批次", "Left/Right change batch"),
+        @("Ctrl+V 粘贴", "Ctrl+V paste"), @("Q 退出", "Q quit"), @("Enter 确认", "Enter confirm"), @("Esc 取消", "Esc cancel"),
+        @("退出向导？未开始的克隆不会写入进度。Enter 确定，Esc 取消。", "Quit the wizard? No progress is written before a clone starts. Enter confirms; Esc cancels."),
+        @("↑↓ 选择选项，Enter 编辑或开始。每个选项的说明会显示在这一行。", "Up/Down select; Enter edits or starts. The selected option's guide appears here."),
+        @("将在当前 git 命令结束后停止。Ctrl+C 再按一次立即结束。", "Stopping after the current git command. Press Ctrl+C again to force stop."),
+        @("初始化本地仓库并配置 partial clone（只拉元数据，不拉文件内容）。", "Initialize the repository and configure partial clone (metadata only)."),
+        @("正在拉取 commit/tree 元数据（blob:none）。文件内容会在下一步按批下载。", "Fetching commit/tree metadata (blob:none). File contents download in batches next."),
+        @("扫描工作区，跳过已经落盘的文件，其余进入待下载队列。", "Scan the workspace, skip files already on disk, and queue the rest."),
+        @("按批 checkout 文件。中断后重跑同一命令即可续传。", "Check out files in batches. Rerun the same command after an interruption to resume."),
+        @("修复 Windows 上可能被弄乱的 git index。", "Repair the Git index if Windows left it inconsistent."),
+        @("Q 停止  ·  P 暂停  ·  ? 帮助", "Q stop  ·  P pause  ·  ? help")
     )
     $result = $Text
     $items = @($pairs)

@@ -1294,7 +1294,10 @@ function Render-GcrTuiWizard {
         $mark = "  "
         if ($sel -eq $i) { $mark = " " + $script:GcrTui.Box.Pointer }
         $val = [string]$it.Value
-        if ($it.Kind -eq "bool") { $val = $(if ($it.Flag) { "开" } else { "关" }) }
+        if ($it.Kind -eq "bool") {
+            if ($script:GcrLanguage -eq "en-US") { $val = $(if ($it.Flag) { "On" } else { "Off" }) }
+            else { $val = $(if ($it.Flag) { "开" } else { "关" }) }
+        }
         if ($St.Edit -and $sel -eq $i) {
             $buf = [string]$St.EditBuf
             $cur = [int]$St.EditCur
