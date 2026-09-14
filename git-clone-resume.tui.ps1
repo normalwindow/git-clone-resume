@@ -1622,7 +1622,7 @@ function Show-GcrTuiWizard {
                 if ($st.Focus -eq "recent") {
                     if ($st.RecentSel -lt ($st.Recent.Count - 1)) {
                         $st.RecentSel++
-                        $recentVisible = [Math]::Max(1, $h - 10)
+                        $recentVisible = [Math]::Max(1, [int](Get-GcrTuiSize).H - 10)
                         if ($st.RecentSel -ge $st.RecentTop + $recentVisible) {
                             $st.RecentTop = $st.RecentSel - $recentVisible + 1
                         }
@@ -1632,7 +1632,8 @@ function Show-GcrTuiWizard {
                     elseif ($st.Recent.Count -gt 0) {
                         $st.Focus = "recent"
                         $st.RecentSel = [Math]::Min($st.RecentSel, $st.Recent.Count - 1)
-                        $st.RecentTop = [Math]::Max(0, $st.RecentSel - [Math]::Max(1, $h - 10) + 1)
+                        $recentVisible = [Math]::Max(1, [int](Get-GcrTuiSize).H - 10)
+                        $st.RecentTop = [Math]::Max(0, $st.RecentSel - $recentVisible + 1)
                     }
                 }
             }
