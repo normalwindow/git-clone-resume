@@ -158,6 +158,8 @@ function Convert-GcrText {
         @("批次", "Batch"), @("失败", "failed"), @("单文件失败:", "Single-file failure:"), @("出错", "Error"),
         @("已停止", "Stopped"), @("中断后续传: ", "Resume after interruption: "), @("仓库目录:", "Repository directory:"),
         @("文件数:", "Files:"), @("清单文件:", "List file:"), @("DryRun 完成", "DryRun complete"),
+        @("DryRun 结束，清单:", "DryRun finished; list:"),
+        @("（blob 体积在 checkout 后统计，避免 ls-tree -l 把全部 blob 拉下来）", "(blob sizes are measured during checkout; ls-tree -l is avoided to prevent downloading all blobs)"),
         @("未下载 blob。去掉 -DryRun 后开始/继续克隆。", "No blobs were downloaded. Remove -DryRun to start or resume."),
         @("检查工作区已有文件", "Checking existing workspace files"), @("进度: 已记录", "Progress: recorded"),
         @("分 ", "Downloading in "), @(" 批下载，每批最多 ", " batches, up to "), @(" 个文件", " files each"),
@@ -184,7 +186,21 @@ function Convert-GcrText {
         @("键盘", "Keyboard"), @("暂无失败文件。", "No failed files."), @("停止", "stop"), @("暂停", "pause"), @("帮助", "help"), @("日志", "log")
     )
     $result = $Text
-    foreach ($pair in $pairs) { $result = $result.Replace([string]$pair[0], [string]$pair[1]) }
+    $items = @($pairs)
+    for ($i = 0; $i -lt $items.Count;) {
+        if ($items[$i] -is [array] -and @($items[$i]).Count -ge 2) {
+            $from = [string]@($items[$i])[0]
+            $to = [string]@($items[$i])[1]
+            $i++
+        } elseif ($i + 1 -lt $items.Count) {
+            $from = [string]$items[$i]
+            $to = [string]$items[$i + 1]
+            $i += 2
+        } else {
+            break
+        }
+        if (-not [string]::IsNullOrEmpty($from)) { $result = $result.Replace($from, $to) }
+    }
     return $result
 }
 
