@@ -1305,7 +1305,8 @@ function Render-GcrTuiWizard {
             if ($cur -gt $buf.Length) { $cur = $buf.Length }
             $val = $buf.Insert($cur, "|")
         }
-        $label = Format-GcrCell $it.Label 20
+        $labelText = Convert-GcrText ([string]$it.Label)
+        $label = Format-GcrCell $labelText 20
         $text = $mark + " " + $label + " " + $val
         $col = $c.W
         if ($it.Kind -eq "start") { $col = $c.G + $c.B }
