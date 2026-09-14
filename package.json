@@ -1,0 +1,29 @@
+{
+  "name": "git-clone-resume",
+  "version": "0.1.0",
+  "description": "Resume-friendly partial clone tool for Windows",
+  "bin": {
+    "gcr": "gcr.cmd",
+    "git-clone-resume": "git-clone-resume.cmd"
+  },
+  "files": [
+    "gcr.cmd",
+    "git-clone-resume.cmd",
+    "git-clone-resume.ps1",
+    "git-clone-resume.tui.ps1",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "win32"
+  ],
+  "keywords": [
+    "git",
+    "clone",
+    "resume",
+    "windows",
+    "powershell"
+  ]
+}

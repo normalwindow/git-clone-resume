@@ -25,6 +25,27 @@
 - Windows PowerShell 5.1（系统自带）或 PowerShell 7+
 - 建议打开 Windows 长路径：`git config --global core.longpaths true`
 
+## 安装与短命令
+
+发布版本会提供一个 ZIP 压缩包。解压到不会随意移动的目录后，将该目录加入用户或系统 `PATH`，即可使用短命令 `gcr`：
+
+```bat
+gcr https://github.com/user/repo.git
+gcr https://github.com/user/repo.git -Ref main -OutDir D:\src\repo
+```
+
+压缩包同时包含完整命令 `git-clone-resume`。`gcr` 只是同目录启动器，不会复制或改变核心脚本；三个 PowerShell 文件需要保持在同一目录。
+
+安装后可在 `cmd.exe`、PowerShell、Windows Terminal 和脚本/CI 中调用。CI 或重定向输出时建议显式使用 `-NoTui`。
+
+后续发布渠道会复用 GitHub Release 中的同一 ZIP 和 SHA256 校验值：
+
+- Scoop：安装后直接提供 `gcr` 命令。
+- winget：用于系统级安装、升级和卸载。
+- npm：执行 `npm install -g git-clone-resume` 后提供 `gcr` 命令，但仍需要 Git for Windows 和 PowerShell。
+
+卸载时只移除工具目录，不会删除任何目标仓库、`.git/partial-resume/` 状态或历史记录文件。
+
 ## 用法
 
 交互式（推荐）：双击 `git-clone-resume.cmd`，或在终端里不带 URL 运行，会打开全屏 TUI 向导。剪贴板里如果是仓库地址会自动填入；底栏会显示当前选项的简短说明。

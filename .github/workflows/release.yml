@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build release package
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}" -replace '^v', ''
+          $package = Get-Content -Raw -LiteralPath package.json | ConvertFrom-Json
+          $fileVersion = $package.version
+          if ($tagVersion -ne $fileVersion) {
+            throw "Tag version $tagVersion does not match VERSION $fileVersion"
+          }
+
+          $packageName = "git-clone-resume-$fileVersion"
+          $packageDir = Join-Path $env:RUNNER_TEMP $packageName
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE "$packageName.zip"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+
+          $files = @(
+            'README.md',
+            'package.json',
+            'gcr.cmd',
+            'git-clone-resume.cmd',
+            'git-clone-resume.ps1',
+            'git-clone-resume.tui.ps1'
+          )
+          foreach ($file in $files) {
+            Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $file) -Destination $packageDir
+          }
+
+          Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $zipPath)" | Set-Content -Encoding ascii "$zipPath.sha256"
+
+          "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "$env:ZIP_PATH" `
+            "$env:ZIP_PATH.sha256" `
+            --title "git-clone-resume ${{ github.ref_name }}" `
+            --generate-notes
