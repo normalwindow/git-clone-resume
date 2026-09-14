@@ -204,6 +204,30 @@ function Convert-GcrText {
         @("Q 停止  ·  P 暂停  ·  ? 帮助", "Q stop  ·  P pause  ·  ? help")
     )
     $result = $Text
+    $direct = [ordered]@{
+        "断点续传克隆" = "Resumable clone"
+        "按批 checkout" = "batch checkout"
+        "仓库 URL" = "Repository URL"
+        "本地目录" = "Local directory"
+        "分支/标签" = "Branch/tag"
+        "每批文件" = "Files per batch"
+        "重试次数" = "Retries"
+        "只含路径" = "Include paths"
+        "排除路径" = "Exclude paths"
+        "浅克隆深度" = "Clone depth"
+        "哈希校验" = "Hash verification"
+        "开始克隆" = "Start clone"
+        "强制重新 fetch 目标 ref。换分支或更新到最新 commit 时打开。Space 开关。" = "Force-fetch the target ref. Enable when changing branches or updating to the latest commit. Space toggles."
+        "只列出将要处理的文件，不下载 blob。适合先看清单。Space 开关。" = "List files without downloading blobs. Useful for previewing the file list. Space toggles."
+        "按上面的设置开始或继续克隆。Enter 启动。中断后重跑即可续传。" = "Start or resume with the settings above. Press Enter to begin; rerun after interruption."
+        "Enter 编辑/开始" = "Enter edit/start"
+        "Space 开关" = "Space toggle"
+        "←→ 改批次" = "Left/Right change batch"
+        "Ctrl+V 粘贴" = "Ctrl+V paste"
+        "Q 退出" = "Q quit"
+        "Language" = "Language"
+    }
+    foreach ($key in $direct.Keys) { $result = $result.Replace($key, [string]$direct[$key]) }
     $items = @($pairs)
     for ($i = 0; $i -lt $items.Count;) {
         if ($items[$i] -is [array] -and @($items[$i]).Count -ge 2) {
