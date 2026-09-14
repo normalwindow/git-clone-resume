@@ -1,5 +1,7 @@
 # Git 断点续传克隆（Windows）
 
+English documentation: [README.en.md](README.en.md). 启动向导时可选择语言，也可使用 `-Language en-US`；向导和克隆面板中按 `L` 可随时切换。
+
 针对 GitHub 等网络不稳定场景：先用 **partial clone** 只拉 commit/tree 元数据，再 **按批 checkout 文件**。中断后用同一条命令再跑即可续传。
 
 对应 Linux 参考脚本：<https://github.com/chaihahaha/git-cheatsheet> 中的 `clone_1by1.sh`。

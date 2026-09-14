@@ -752,6 +752,10 @@ function Invoke-GcrTuiKey {
             $script:GcrTui.Dirty = $true
         }
         "H" { $script:GcrTui.Help = $true; $script:GcrTui.Dirty = $true }
+        "L" {
+            $script:GcrLanguage = $(if ($script:GcrLanguage -eq "en-US") { "zh-CN" } else { "en-US" })
+            $script:GcrTui.Dirty = $true
+        }
         "F" { $script:GcrTui.FailView = -not $script:GcrTui.FailView; $script:GcrTui.Dirty = $true }
         "UpArrow" {
             $script:GcrTui.LogOffset = [Math]::Min($script:GcrTui.Logs.Count, $script:GcrTui.LogOffset + 1)
@@ -902,6 +906,8 @@ function Render-GcrTui {
     function Push-GcrRow {
         param([string]$Left, [string]$Right = "", [string]$Color = "")
         if (-not $Color) { $Color = $c.W }
+        $Left = Convert-GcrText $Left
+        $Right = Convert-GcrText $Right
         $leftW = Get-GcrDisplayWidth $Left
         $rightW = Get-GcrDisplayWidth $Right
         $gap = $inner - $leftW - $rightW
@@ -1210,6 +1216,7 @@ function Convert-GcrWizardResult {
     Add-Member -InputObject $obj -NotePropertyName Verify -NotePropertyValue ([bool]$St.Verify)
     Add-Member -InputObject $obj -NotePropertyName ForceRefetch -NotePropertyValue ([bool]$St.ForceRefetch)
     Add-Member -InputObject $obj -NotePropertyName DryRun -NotePropertyValue ([bool]$St.DryRun)
+    Add-Member -InputObject $obj -NotePropertyName Language -NotePropertyValue ([string]$St.Language)
     return ,$obj
 }
 
@@ -1256,6 +1263,7 @@ function Render-GcrTuiWizard {
     }
     function WRow([string]$Text, [string]$Color, [switch]$Sel) {
         if (-not $Color) { $Color = $c.W }
+        $Text = Convert-GcrText $Text
         $body = Format-GcrCell -Text $Text -Width $inner
         if ($Sel) { $Color = (Get-GcrColor "rev") + $Color }
         $row = $c.D + $box.V + $c.R + $Color + $body + $c.R + $c.D + $box.V + $c.R
@@ -1268,7 +1276,7 @@ function Render-GcrTuiWizard {
     WRow " 断点续传克隆  ·  partial clone + 按批 checkout" $c.D
     WBorder "mid"
 
-    $formEnd = 11
+    $formEnd = 12
     $recent = @($St.Recent)
     $maxFormVisible = [Math]::Max(6, $h - 10)
     if ($maxFormVisible -gt ($formEnd + 1)) { $maxFormVisible = $formEnd + 1 }
@@ -1363,6 +1371,7 @@ function Get-GcrWizardItems {
         @{ Id = "verify";  Kind = "bool";  Label = "哈希校验";    Value = ""; Flag = [bool]$St.Verify; Guide = "续传时对已有文件做 hash-object 校验，哈希不一致则重新下载。Space 开关。" }
         @{ Id = "force";   Kind = "bool";  Label = "强制 refetch"; Value = ""; Flag = [bool]$St.ForceRefetch; Guide = "强制重新 fetch 目标 ref。换分支或更新到最新 commit 时打开。Space 开关。" }
         @{ Id = "dry";     Kind = "bool";  Label = "DryRun";     Value = ""; Flag = [bool]$St.DryRun; Guide = "只列出将要处理的文件，不下载 blob。适合先看清单。Space 开关。" }
+        @{ Id = "language"; Kind = "enum"; Label = "语言"; Value = $(if ($St.Language -eq "en-US") { "英文" } else { "中文" }); Flag = $false; Guide = "选择界面语言。可随时按 L 在中文和英文之间切换。" }
         @{ Id = "start";   Kind = "start"; Label = "开始克隆";    Value = ""; Flag = $false; Guide = "按上面的设置开始或继续克隆。Enter 启动。中断后重跑即可续传。" }
     )
 }
@@ -1374,7 +1383,7 @@ function Apply-GcrRecentToWizard {
     if ($Item.outDir) { $St.OutDir = [string]$Item.outDir; $St.OutDirAuto = $false }
     if ($Item.ref) { $St.Ref = [string]$Item.ref }
     $St.Focus = "form"
-    $St.Sel = 11
+    $St.Sel = 12
 }
 
 function Show-GcrTuiWizard {
@@ -1407,6 +1416,7 @@ function Show-GcrTuiWizard {
         OutDir       = $dir
         OutDirAuto   = $dirAuto
         Ref          = $ref
+        Language     = $(if ($script:GcrLanguage) { $script:GcrLanguage } else { "zh-CN" })
         BatchSize    = $batch
         MaxRetries   = $retries
         Include      = ""
@@ -1537,7 +1547,7 @@ function Show-GcrTuiWizard {
             "UpArrow" {
                 if ($st.Focus -eq "recent") {
                     if ($st.RecentSel -gt 0) { $st.RecentSel-- }
-                    else { $st.Focus = "form"; $st.Sel = 11 }
+                    else { $st.Focus = "form"; $st.Sel = 12 }
                 } else {
                     if ($st.Sel -gt 0) { $st.Sel-- }
                 }
@@ -1546,7 +1556,7 @@ function Show-GcrTuiWizard {
                 if ($st.Focus -eq "recent") {
                     if ($st.RecentSel -lt ($st.Recent.Count - 1)) { $st.RecentSel++ }
                 } else {
-                    if ($st.Sel -lt 11) { $st.Sel++ }
+                    if ($st.Sel -lt 12) { $st.Sel++ }
                     elseif ($st.Recent.Count -gt 0) { $st.Focus = "recent"; $st.RecentSel = 0 }
                 }
             }
@@ -1557,10 +1567,13 @@ function Show-GcrTuiWizard {
             }
             "J" {
                 if ($k.KeyChar -eq "j") {
-                    if ($st.Focus -eq "form" -and $st.Sel -lt 11) { $st.Sel++ }
+                    if ($st.Focus -eq "form" -and $st.Sel -lt 12) { $st.Sel++ }
                 }
             }
             "LeftArrow" {
+                if ($st.Focus -eq "form" -and $st.Sel -eq 11) {
+                    $st.Language = "zh-CN"
+                }
                 if ($st.Focus -eq "form" -and $st.Sel -eq 3) {
                     $idx = [array]::IndexOf($batches, [int]$st.BatchSize)
                     if ($idx -lt 0) { $idx = 2 }
@@ -1573,6 +1586,9 @@ function Show-GcrTuiWizard {
                 }
             }
             "RightArrow" {
+                if ($st.Focus -eq "form" -and $st.Sel -eq 11) {
+                    $st.Language = "en-US"
+                }
                 if ($st.Focus -eq "form" -and $st.Sel -eq 3) {
                     $idx = [array]::IndexOf($batches, [int]$st.BatchSize)
                     if ($idx -lt 0) { $idx = 2 }
@@ -1589,6 +1605,7 @@ function Show-GcrTuiWizard {
                     if ($st.Sel -eq 8) { $st.Verify = -not $st.Verify }
                     elseif ($st.Sel -eq 9) { $st.ForceRefetch = -not $st.ForceRefetch }
                     elseif ($st.Sel -eq 10) { $st.DryRun = -not $st.DryRun }
+                    elseif ($st.Sel -eq 11) { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); $script:GcrLanguage = $st.Language }
                 }
             }
             "Enter" {
@@ -1617,6 +1634,7 @@ function Show-GcrTuiWizard {
                 } elseif ($id -eq "verify") { $st.Verify = -not $st.Verify }
                 elseif ($id -eq "force") { $st.ForceRefetch = -not $st.ForceRefetch }
                 elseif ($id -eq "dry") { $st.DryRun = -not $st.DryRun }
+                elseif ($id -eq "language") { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); $script:GcrLanguage = $st.Language }
                 elseif ($id -eq "batch" -or $id -eq "retry") { }
                 else {
                     $st.Edit = $true
@@ -1647,6 +1665,10 @@ function Show-GcrTuiWizard {
                 }
             }
             default {
+                if ($k.KeyChar -eq "l" -or $k.KeyChar -eq "L") {
+                    $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" })
+                    $script:GcrLanguage = $st.Language
+                }
                 if ($k.KeyChar -eq "?") { $st.Error = "Enter 编辑 · Space 开关 · Tab 最近任务 · S 开始 · Q 退出" }
             }
         }
@@ -1669,20 +1691,20 @@ function Show-GcrCliWizard {
     }
     $prompt = "仓库 URL"
     if ($pre) { $prompt = "仓库 URL [$pre]" }
-    $url = Read-Host $prompt
+    $url = Read-Host (Convert-GcrText $prompt)
     if ([string]::IsNullOrWhiteSpace($url)) { $url = $pre }
     if ([string]::IsNullOrWhiteSpace($url)) { return $null }
     $defDir = Get-GcrFolderNameSafe -Url $url
     if ($Defaults -and $Defaults.ContainsKey("OutDir") -and $Defaults.OutDir) { $defDir = [string]$Defaults.OutDir }
-    $dir = Read-Host "本地目录 [$defDir]"
+    $dir = Read-Host (Convert-GcrText "本地目录 [$defDir]")
     if ([string]::IsNullOrWhiteSpace($dir)) { $dir = $defDir }
     $defRef = "HEAD"
     if ($Defaults -and $Defaults.ContainsKey("Ref") -and $Defaults.Ref) { $defRef = [string]$Defaults.Ref }
-    $ref = Read-Host "分支/标签/commit [$defRef]"
+    $ref = Read-Host (Convert-GcrText "分支/标签/commit [$defRef]")
     if ([string]::IsNullOrWhiteSpace($ref)) { $ref = $defRef }
     $batch = 32
     if ($Defaults -and $Defaults.ContainsKey("BatchSize") -and $Defaults.BatchSize) { $batch = [int]$Defaults.BatchSize }
-    $batchText = Read-Host "每批文件数 [$batch]"
+    $batchText = Read-Host (Convert-GcrText "每批文件数 [$batch]")
     if ($batchText -match "^\d+$") { $batch = [int]$batchText }
     return @{
         RepoUrl      = $url.Trim()

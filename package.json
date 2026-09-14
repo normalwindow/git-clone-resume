@@ -1,6 +1,6 @@
 {
   "name": "git-clone-resume",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Resume-friendly partial clone tool for Windows",
   "bin": {
     "gcr": "gcr.cmd",
@@ -11,7 +11,8 @@
     "git-clone-resume.cmd",
     "git-clone-resume.ps1",
     "git-clone-resume.tui.ps1",
-    "README.md"
+    "README.md",
+    "README.en.md"
   ],
   "engines": {
     "node": ">=16"

@@ -105,6 +105,9 @@ param(
 
     [switch]$NoTui,
 
+    [ValidateSet("zh-CN", "en-US")]
+    [string]$Language = "zh-CN",
+
     [switch]$ResumeLast,
 
     [switch]$Help
@@ -133,6 +136,57 @@ $script:StateDirName = "partial-resume"
 $script:GcrTuiWanted = $false
 $script:GcrExitCode = 0
 $script:GcrUserStop = $false
+$script:GcrLanguage = $Language
+
+function Convert-GcrText {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text -or $script:GcrLanguage -ne "en-US") { return $Text }
+    $pairs = @(
+        @("未找到 git。请先安装 Git for Windows", "Git was not found. Install Git for Windows"),
+        @("错误:", "Error:"), @("必须提供仓库 URL。", "A repository URL is required."),
+        @("无法读取历史记录。", "Could not read history."),
+        @("没有可恢复的历史记录。请先启动过一次克隆。", "No resumable history was found. Start a clone first."),
+        @("向导失败:", "Wizard failed:"), @("无法开始克隆", "Could not start clone"),
+        @("当前终端无法进入全屏 TUI，改用日志模式。Windows Terminal 下再试，或去掉 -Tui。", "This terminal cannot enter fullscreen TUI; using log mode. Try Windows Terminal or remove -Tui."),
+        @("已由用户停止。", "Stopped by user."), @("再次运行同一命令即可续传。", "Run the same command again to resume."),
+        @("使用 ", "Using "), @("仓库:", "Repository:"), @("目录:", "Directory:"), @("引用:", "Ref:"),
+        @("语言", "Language"), @("中文", "Chinese"), @("英文", "English"), @("开", "On"), @("关", "Off"),
+        @("目标 commit:", "Target commit:"), @("fetch 元数据:", "Fetching metadata:"), @("枚举文件树", "Enumerating file tree"),
+        @("树中条目:", "Tree entries:"), @("待处理文件:", "Pending files:"), @("工作区:", "Workspace:"),
+        @("全部文件已就绪。", "All files are ready."), @("完成", "Complete"), @("克隆完成", "Clone complete"),
+        @("部分文件失败", "Some files failed"), @("失败列表:", "Failure list:"), @("仍失败:", "Still failed:"),
+        @("批次", "Batch"), @("失败", "failed"), @("单文件失败:", "Single-file failure:"), @("出错", "Error"),
+        @("已停止", "Stopped"), @("中断后续传: ", "Resume after interruption: "), @("仓库目录:", "Repository directory:"),
+        @("文件数:", "Files:"), @("清单文件:", "List file:"), @("DryRun 完成", "DryRun complete"),
+        @("未下载 blob。去掉 -DryRun 后开始/继续克隆。", "No blobs were downloaded. Remove -DryRun to start or resume."),
+        @("检查工作区已有文件", "Checking existing workspace files"), @("进度: 已记录", "Progress: recorded"),
+        @("分 ", "Downloading in "), @(" 批下载，每批最多 ", " batches, up to "), @(" 个文件", " files each"),
+        @("跳过", "Skipped"), @("个子模块（gitlink）。需要的话请在对应目录单独再跑本脚本。", " submodules (gitlinks). Run this script separately if needed.")
+        ,@("断点续传克隆", "Resumable clone"), @("按批 checkout", "batch checkout"), @("刚刚", "just now"),
+        @("分钟前", " minutes ago"), @("小时前", " hours ago"), @("天前", " days ago"),
+        @("就绪", "Ready"), @("设置", "Setup"), @("初始化仓库", "Initialize repository"), @("拉取元数据", "Fetch metadata"),
+        @("枚举文件树", "List file tree"), @("扫描已有文件", "Scan existing files"), @("下载文件", "Download files"),
+        @("修复 git index", "Repair git index"), @("快捷键说明。任意键关闭此帮助。", "Keyboard help. Press any key to close."),
+        @("失败文件列表。F 返回活动日志，再次运行同一命令会重试。", "Failed files. Press F to return; run the same command to retry."),
+        @("本次运行已结束。Enter 关闭界面，进度保留在 .git/partial-resume/。", "This run has ended. Press Enter to close; progress remains in .git/partial-resume/."),
+        @("已暂停：当前批次结束后停住。Space 继续，Q 停止。", "Paused after the current batch. Space resumes; Q stops."),
+        @("全部完成。工作区已可用。", "Everything is complete. The workspace is ready."),
+        @("出错或未完成。重新运行同一命令即可从断点继续。", "Failed or incomplete. Run the same command to resume."),
+        @("远程仓库地址，支持 https、ssh、git@ 以及本地路径。Ctrl+V 从剪贴板粘贴。", "Remote repository URL. Supports https, ssh, git@, and local paths. Ctrl+V pastes from the clipboard."),
+        @("工作区目录。留空则用仓库名。已有 .git/partial-resume 时自动续传。", "Workspace directory. Leave empty to use the repository name. Existing .git/partial-resume state resumes automatically."),
+        @("选择界面语言。可随时按 L 在中文和英文之间切换。", "Interface language. Press L at any time to switch between Chinese and English."),
+        @("最近任务", "Recent tasks"), @("切换", "switch"), @("填入", "fill in"), @("无。完成一次克隆后会出现在这里", "None. Completed clones appear here"),
+        @("Enter 编辑/开始", "Enter edit/start"), @("Space 开关", "Space toggle"), @("改批次", "change batch"), @("粘贴", "paste"), @("退出", "quit"),
+        @("按上面的设置开始或继续克隆。Enter 启动。中断后重跑即可续传。", "Start or resume with the settings above. Press Enter to begin; rerun after interruption."),
+        @("请填写仓库 URL（Ctrl+V 可从剪贴板粘贴）", "Enter a repository URL (Ctrl+V pastes from the clipboard)"),
+        @("语言", "Language"), @("中文", "Chinese"), @("英文", "English")
+        ,@(" 仓库  ", " Repository  "), @(" 目录  ", " Directory  "), @(" 引用  ", " Ref  "), @(" 阶段  ", " Phase  "), @(" 当前  ", " Current  "),
+        @("键盘", "Keyboard"), @("暂无失败文件。", "No failed files."), @("停止", "stop"), @("暂停", "pause"), @("帮助", "help"), @("日志", "log")
+    )
+    $result = $Text
+    foreach ($pair in $pairs) { $result = $result.Replace([string]$pair[0], [string]$pair[1]) }
+    return $result
+}
 
 $script:GcrTuiFile = Join-Path $PSScriptRoot "git-clone-resume.tui.ps1"
 if (-not $PSScriptRoot) {
@@ -173,6 +227,7 @@ function Write-Log {
         elseif ($Message -is [System.Array]) { $text = (@($Message | ForEach-Object { "$_" }) -join " ") }
         else { $text = [string]$Message }
     } catch { $text = "$Message" }
+    $text = Convert-GcrText $text
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $color = switch ($Level) {
         "INFO"  { "Gray" }
@@ -218,6 +273,7 @@ function Show-Usage {
     Write-Host "  -DryRun                 List files, do not checkout blobs"
     Write-Host "  -Tui                    Force fullscreen TUI"
     Write-Host "  -NoTui                  Disable TUI (script/CI mode)"
+    Write-Host "  -Language zh-CN|en-US   User interface language"
     Write-Host "  -ResumeLast             Resume the latest history entry"
     Write-Host "  -Help                   Show this help"
     Write-Host ""
@@ -966,12 +1022,12 @@ if ($NoTui) {
 
 if ($ResumeLast) {
     if (-not (Get-Command Get-GcrHistoryLast -ErrorAction SilentlyContinue)) {
-        Write-Host "错误: 无法读取历史记录。" -ForegroundColor Red
+        Write-Host (Convert-GcrText "错误: 无法读取历史记录。") -ForegroundColor Red
         exit 2
     }
     $last = Get-GcrHistoryLast
     if ($null -eq $last) {
-        Write-Host "错误: 没有可恢复的历史记录。请先启动过一次克隆。" -ForegroundColor Red
+        Write-Host (Convert-GcrText "错误: 没有可恢复的历史记录。请先启动过一次克隆。") -ForegroundColor Red
         exit 2
     }
     if ([string]::IsNullOrWhiteSpace($RepoUrl) -and $last.url) { $RepoUrl = [string]$last.url }
@@ -982,7 +1038,7 @@ if ($ResumeLast) {
 if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
     if ($NoTui -or -not $script:GcrInteractive) {
         Show-Usage
-        Write-Host "错误: 必须提供仓库 URL。" -ForegroundColor Red
+        Write-Host (Convert-GcrText "错误: 必须提供仓库 URL。") -ForegroundColor Red
         exit 2
     }
     $defaults = @{
@@ -1000,7 +1056,7 @@ if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
     if ($PSBoundParameters.ContainsKey("Depth")) { $defaults["Depth"] = $Depth }
     if (-not (Get-Command Show-GcrInteractiveSetup -ErrorAction SilentlyContinue)) {
         Show-Usage
-        Write-Host "错误: 必须提供仓库 URL。" -ForegroundColor Red
+        Write-Host (Convert-GcrText "错误: 必须提供仓库 URL。") -ForegroundColor Red
         exit 2
     }
     $wiz = $null
@@ -1021,6 +1077,9 @@ if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
     }
     try {
         $RepoUrl = [string]$wiz.RepoUrl
+        if ($wiz.Language -eq "en-US" -or $wiz.Language -eq "zh-CN") {
+            $script:GcrLanguage = [string]$wiz.Language
+        }
         if ($wiz.OutDir) { $OutDir = [string]$wiz.OutDir }
         if ($wiz.Ref) { $Ref = [string]$wiz.Ref }
         if ($wiz.BatchSize) { $BatchSize = [int]$wiz.BatchSize }
@@ -1048,14 +1107,14 @@ if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
 if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
     if (Get-Command Close-GcrTui -ErrorAction SilentlyContinue) { Close-GcrTui }
     Show-Usage
-    Write-Host "错误: 必须提供仓库 URL。" -ForegroundColor Red
+    Write-Host (Convert-GcrText "错误: 必须提供仓库 URL。") -ForegroundColor Red
     exit 2
 }
 
 if ($script:GcrTuiWanted -and (Get-Command Initialize-GcrTui -ErrorAction SilentlyContinue)) {
     if (-not (Test-GcrTuiActive)) { [void](Initialize-GcrTui) }
     if ($Tui -and -not (Test-GcrTuiActive)) {
-        Write-Host "当前终端无法进入全屏 TUI，改用日志模式。Windows Terminal 下再试，或去掉 -Tui。" -ForegroundColor Yellow
+        Write-Host (Convert-GcrText "当前终端无法进入全屏 TUI，改用日志模式。Windows Terminal 下再试，或去掉 -Tui。") -ForegroundColor Yellow
     }
 }
 
