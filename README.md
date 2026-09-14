@@ -47,7 +47,8 @@ gcr https://github.com/user/repo.git -Ref main -OutDir D:\src\repo
   scoop install git-clone-resume
   ```
 
-- winget：用于系统级安装、升级和卸载。
+- winget：待增加 `.exe` 启动器后提交官方 manifest，用于系统级安装、升级和卸载。
+
 - npm：执行 `npm install -g git-clone-resume` 后提供 `gcr` 命令，但仍需要 Git for Windows 和 PowerShell。
 
 卸载时只移除工具目录，不会删除任何目标仓库、`.git/partial-resume/` 状态或历史记录文件。
