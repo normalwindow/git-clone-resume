@@ -23,7 +23,7 @@ jobs:
           $package = Get-Content -Raw -LiteralPath package.json | ConvertFrom-Json
           $fileVersion = $package.version
           if ($tagVersion -ne $fileVersion) {
-            throw "Tag version $tagVersion does not match VERSION $fileVersion"
+            throw "Tag version $tagVersion does not match package.json $fileVersion"
           }
 
           $packageName = "git-clone-resume-$fileVersion"
