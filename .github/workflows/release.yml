@@ -41,6 +41,7 @@ jobs:
 
           $files = @(
             'README.md',
+            'README.en.md',
             'package.json',
             'gcr.cmd',
             'git-clone-resume.cmd',
