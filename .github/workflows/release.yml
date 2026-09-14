@@ -31,6 +31,14 @@ jobs:
           $zipPath = Join-Path $env:GITHUB_WORKSPACE "$packageName.zip"
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
 
+          $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          $launcherSource = Join-Path $env:GITHUB_WORKSPACE 'gcr.launcher.cs'
+          $launcherPath = Join-Path $packageDir 'gcr.exe'
+          & $compiler /nologo /target:exe /optimize+ "/out:$launcherPath" $launcherSource
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not compile gcr.exe"
+          }
+
           $files = @(
             'README.md',
             'package.json',
