@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+PackageIdentifier: normalwindow.git-clone-resume
+PackageVersion: 0.1.1
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: gcr.exe
+    PortableCommandAlias: gcr
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/normalwindow/git-clone-resume/releases/download/v0.1.1/git-clone-resume-0.1.1.zip
+    InstallerSha256: 2c3ff676fb617646f28b6d834c66cc6d9a5ae7c54ad4e4f269393508f507e93a
+ManifestType: installer
+ManifestVersion: 1.9.0
