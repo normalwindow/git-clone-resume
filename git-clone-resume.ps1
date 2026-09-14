@@ -412,6 +412,14 @@ if (Test-Path -LiteralPath $script:GcrTuiFile) {
     function Save-GcrHistory { }
 }
 
+if (-not $PSBoundParameters.ContainsKey("Language") -and (Get-Command Get-GcrLanguagePreference -ErrorAction SilentlyContinue)) {
+    $savedLanguage = Get-GcrLanguagePreference
+    if ($savedLanguage) { $script:GcrLanguage = $savedLanguage }
+}
+if ($PSBoundParameters.ContainsKey("Language") -and (Get-Command Save-GcrLanguagePreference -ErrorAction SilentlyContinue)) {
+    Save-GcrLanguagePreference -Language $Language
+}
+
 function Write-Log {
     param(
         $Message,
@@ -1275,7 +1283,7 @@ if ([string]::IsNullOrWhiteSpace($RepoUrl)) {
     try {
         $RepoUrl = [string]$wiz.RepoUrl
         if ($wiz.Language -eq "en-US" -or $wiz.Language -eq "zh-CN") {
-            $script:GcrLanguage = [string]$wiz.Language
+            Set-GcrLanguage -Language ([string]$wiz.Language)
         }
         if ($wiz.OutDir) { $OutDir = [string]$wiz.OutDir }
         if ($wiz.Ref) { $Ref = [string]$wiz.Ref }

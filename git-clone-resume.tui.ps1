@@ -539,6 +539,42 @@ function Get-GcrHistoryPath {
     return (Join-Path (Join-Path $root "git-clone-resume") "history.json")
 }
 
+function Get-GcrSettingsPath {
+    $historyPath = Get-GcrHistoryPath
+    return (Join-Path (Split-Path -Parent $historyPath) "settings.json")
+}
+
+function Get-GcrLanguagePreference {
+    try {
+        $path = Get-GcrSettingsPath
+        if (-not (Test-Path -LiteralPath $path)) { return $null }
+        $settings = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+        if ($settings.language -eq "en-US" -or $settings.language -eq "zh-CN") {
+            return [string]$settings.language
+        }
+    } catch { }
+    return $null
+}
+
+function Save-GcrLanguagePreference {
+    param([ValidateSet("zh-CN", "en-US")][string]$Language)
+    try {
+        $path = Get-GcrSettingsPath
+        $dir = Split-Path -Parent $path
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $settings = @{ language = $Language; updated = (Get-Date).ToString("o") }
+        [System.IO.File]::WriteAllText($path, (ConvertTo-Json $settings), (New-Object System.Text.UTF8Encoding $false))
+    } catch { }
+}
+
+function Set-GcrLanguage {
+    param([ValidateSet("zh-CN", "en-US")][string]$Language)
+    $script:GcrLanguage = $Language
+    Save-GcrLanguagePreference -Language $Language
+}
+
 function Get-GcrHistory {
     $path = Get-GcrHistoryPath
     if (-not (Test-Path -LiteralPath $path)) { return @() }
@@ -609,6 +645,12 @@ function Format-GcrAgo {
         $dt = [datetime]$When
     } catch { return "" }
     $d = (Get-Date) - $dt
+    if ($script:GcrLanguage -eq "en-US") {
+        if ($d.TotalSeconds -lt 60) { return "just now" }
+        if ($d.TotalMinutes -lt 60) { return ("{0} minutes ago" -f [int]$d.TotalMinutes) }
+        if ($d.TotalHours -lt 24) { return ("{0} hours ago" -f [int]$d.TotalHours) }
+        return ("{0} days ago" -f [int]$d.TotalDays)
+    }
     if ($d.TotalSeconds -lt 60) { return "刚刚" }
     if ($d.TotalMinutes -lt 60) { return ("{0} 分钟前" -f [int]$d.TotalMinutes) }
     if ($d.TotalHours -lt 24) { return ("{0} 小时前" -f [int]$d.TotalHours) }
@@ -753,7 +795,7 @@ function Invoke-GcrTuiKey {
         }
         "H" { $script:GcrTui.Help = $true; $script:GcrTui.Dirty = $true }
         "L" {
-            $script:GcrLanguage = $(if ($script:GcrLanguage -eq "en-US") { "zh-CN" } else { "en-US" })
+            Set-GcrLanguage -Language $(if ($script:GcrLanguage -eq "en-US") { "zh-CN" } else { "en-US" })
             $script:GcrTui.Dirty = $true
         }
         "F" { $script:GcrTui.FailView = -not $script:GcrTui.FailView; $script:GcrTui.Dirty = $true }
@@ -1314,15 +1356,31 @@ function Render-GcrTuiWizard {
     }
 
     WBorder "mid"
-    WRow " 最近任务  (Tab 切换  ·  Enter 填入)" $c.D
-    $recentSlots = $h - $lines.Count - 4
+    $recentSlots = $h - $lines.Count - 5
     if ($recentSlots -lt 1) { $recentSlots = 1 }
+    $recentTop = [int]$St.RecentTop
+    $maxRecentTop = [Math]::Max(0, $recent.Count - $recentSlots)
+    if ($recentTop -gt $maxRecentTop) { $recentTop = $maxRecentTop; $St.RecentTop = $recentTop }
+    if ($St.Focus -eq "recent") {
+        if ($St.RecentSel -lt $recentTop) { $recentTop = [int]$St.RecentSel; $St.RecentTop = $recentTop }
+        if ($St.RecentSel -ge $recentTop + $recentSlots) {
+            $recentTop = [int]$St.RecentSel - $recentSlots + 1
+            $St.RecentTop = $recentTop
+        }
+    }
+    $recentTitle = " 最近任务  (Tab 切换  ·  Enter 填入)"
+    if ($recent.Count -gt $recentSlots) {
+        $visibleEnd = [Math]::Min($recent.Count, $recentTop + $recentSlots)
+        $recentTitle = $recentTitle + ("  [{0}-{1}/{2}]" -f ($recentTop + 1), $visibleEnd, $recent.Count)
+    }
+    WRow $recentTitle $c.D
     if ($recent.Count -eq 0) {
         WRow "    （无。完成一次克隆后会出现在这里）" $c.D
         $recentSlots--
     } else {
-        $show = [Math]::Min($recent.Count, [Math]::Max(1, $recentSlots))
-        for ($r = 0; $r -lt $show; $r++) {
+        $show = [Math]::Min($recent.Count - $recentTop, [Math]::Max(1, $recentSlots))
+        for ($slot = 0; $slot -lt $show; $slot++) {
+            $r = $recentTop + $slot
             $it = $recent[$r]
             $name = [string]$it.outDir
             if ($name) { $name = Split-Path -Leaf $name }
@@ -1431,6 +1489,7 @@ function Show-GcrTuiWizard {
         DryRun       = $false
         Sel          = 0
         RecentSel    = 0
+        RecentTop    = 0
         Focus        = "form"
         Edit         = $false
         EditBuf      = ""
@@ -1550,7 +1609,10 @@ function Show-GcrTuiWizard {
             }
             "UpArrow" {
                 if ($st.Focus -eq "recent") {
-                    if ($st.RecentSel -gt 0) { $st.RecentSel-- }
+                    if ($st.RecentSel -gt 0) {
+                        $st.RecentSel--
+                        if ($st.RecentSel -lt $st.RecentTop) { $st.RecentTop = $st.RecentSel }
+                    }
                     else { $st.Focus = "form"; $st.Sel = 12 }
                 } else {
                     if ($st.Sel -gt 0) { $st.Sel-- }
@@ -1558,10 +1620,20 @@ function Show-GcrTuiWizard {
             }
             "DownArrow" {
                 if ($st.Focus -eq "recent") {
-                    if ($st.RecentSel -lt ($st.Recent.Count - 1)) { $st.RecentSel++ }
+                    if ($st.RecentSel -lt ($st.Recent.Count - 1)) {
+                        $st.RecentSel++
+                        $recentVisible = [Math]::Max(1, $h - 10)
+                        if ($st.RecentSel -ge $st.RecentTop + $recentVisible) {
+                            $st.RecentTop = $st.RecentSel - $recentVisible + 1
+                        }
+                    }
                 } else {
                     if ($st.Sel -lt 12) { $st.Sel++ }
-                    elseif ($st.Recent.Count -gt 0) { $st.Focus = "recent"; $st.RecentSel = 0 }
+                    elseif ($st.Recent.Count -gt 0) {
+                        $st.Focus = "recent"
+                        $st.RecentSel = [Math]::Min($st.RecentSel, $st.Recent.Count - 1)
+                        $st.RecentTop = [Math]::Max(0, $st.RecentSel - [Math]::Max(1, $h - 10) + 1)
+                    }
                 }
             }
             "K" {
@@ -1609,7 +1681,7 @@ function Show-GcrTuiWizard {
                     if ($st.Sel -eq 8) { $st.Verify = -not $st.Verify }
                     elseif ($st.Sel -eq 9) { $st.ForceRefetch = -not $st.ForceRefetch }
                     elseif ($st.Sel -eq 10) { $st.DryRun = -not $st.DryRun }
-                    elseif ($st.Sel -eq 11) { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); $script:GcrLanguage = $st.Language }
+                    elseif ($st.Sel -eq 11) { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); Set-GcrLanguage -Language $st.Language }
                 }
             }
             "Enter" {
@@ -1638,7 +1710,7 @@ function Show-GcrTuiWizard {
                 } elseif ($id -eq "verify") { $st.Verify = -not $st.Verify }
                 elseif ($id -eq "force") { $st.ForceRefetch = -not $st.ForceRefetch }
                 elseif ($id -eq "dry") { $st.DryRun = -not $st.DryRun }
-                elseif ($id -eq "language") { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); $script:GcrLanguage = $st.Language }
+                elseif ($id -eq "language") { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); Set-GcrLanguage -Language $st.Language }
                 elseif ($id -eq "batch" -or $id -eq "retry") { }
                 else {
                     $st.Edit = $true
@@ -1671,7 +1743,7 @@ function Show-GcrTuiWizard {
             default {
                 if ($k.KeyChar -eq "l" -or $k.KeyChar -eq "L") {
                     $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" })
-                    $script:GcrLanguage = $st.Language
+                    Set-GcrLanguage -Language $st.Language
                 }
                 if ($k.KeyChar -eq "?") { $st.Error = "Enter 编辑 · Space 开关 · Tab 最近任务 · S 开始 · Q 退出" }
             }
