@@ -36,9 +36,13 @@ PowerShell users can call the script directly:
 .\git-clone-resume.ps1 https://github.com/user/repo.git -BatchSize 64 -MaxRetries 12
 .\git-clone-resume.ps1 https://github.com/user/repo.git -Verify
 .\git-clone-resume.ps1 https://github.com/user/repo.git -DryRun
+gcr -Version
+gcr -ClearHistory
 ```
 
-Use `-NoTui` in CI or when output is redirected. Use `-Tui` to force the fullscreen interface.
+Use `-NoTui` in CI or when output is redirected. Use `-Tui` to force the fullscreen interface. `-Version` prints the package version. `-ClearHistory` removes `%LOCALAPPDATA%\git-clone-resume\history.json` without deleting repositories or `.git/partial-resume` state.
+
+In the wizard recent-task list: `Enter` fills the form, `Del` removes the selected entry, `Ctrl+D` clears all history.
 
 ## Language
 

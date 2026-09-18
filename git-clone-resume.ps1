@@ -58,6 +58,13 @@
 .PARAMETER ResumeLast
     从本机历史记录里恢复最近一次未完成（或最近一次）克隆。
 
+.PARAMETER Version
+    显示 git-clone-resume 版本后退出。
+
+.PARAMETER ClearHistory
+    清除本机克隆历史记录（%LOCALAPPDATA%\git-clone-resume\history.json）。
+    不会删除目标仓库或 .git/partial-resume 进度。
+
 .EXAMPLE
     .\git-clone-resume.ps1 https://github.com/chaihahaha/git-cheatsheet.git
 
@@ -110,6 +117,10 @@ param(
 
     [switch]$ResumeLast,
 
+    [switch]$Version,
+
+    [switch]$ClearHistory,
+
     [switch]$Help
 )
 
@@ -137,6 +148,35 @@ $script:GcrTuiWanted = $false
 $script:GcrExitCode = 0
 $script:GcrUserStop = $false
 $script:GcrLanguage = $Language
+$script:GcrVersion = $null
+
+function Get-GcrVersion {
+    if ($script:GcrVersion) { return [string]$script:GcrVersion }
+    $fallback = "0.1.4"
+    try {
+        $root = $PSScriptRoot
+        if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+        $pkg = Join-Path $root "package.json"
+        if (Test-Path -LiteralPath $pkg) {
+            $raw = [System.IO.File]::ReadAllText($pkg)
+            if ($raw -match '"version"\s*:\s*"([^"]+)"') {
+                $script:GcrVersion = [string]$Matches[1]
+                return $script:GcrVersion
+            }
+        }
+    } catch { }
+    $script:GcrVersion = $fallback
+    return $script:GcrVersion
+}
+
+function Show-GcrVersion {
+    Write-Host ("git-clone-resume {0}" -f (Get-GcrVersion))
+}
+
+if ($Version -or $RepoUrl -eq "--version" -or $RepoUrl -eq "-version") {
+    Show-GcrVersion
+    exit 0
+}
 
 function Convert-GcrText {
     param([AllowNull()][string]$Text)
@@ -195,6 +235,12 @@ function Convert-GcrText {
         "退出向导？未开始的克隆不会写入进度。Enter 确定，Esc 取消。" = "Quit the wizard? No progress is written before a clone starts. Enter confirms; Esc cancels."
         "正在编辑。Enter 确认，Esc 取消，Ctrl+V 粘贴。光标用 ← → Home End。" = "Editing. Enter confirms, Esc cancels, Ctrl+V pastes. Move with Left/Right, Home, or End."
         "最近任务。Enter 填入 URL/目录/分支，可直接续传未完成的克隆。" = "Recent tasks. Enter fills in the URL, directory, and branch to resume an incomplete clone."
+        "清空全部历史记录？不会删除仓库或 .git/partial-resume 进度。Enter 确定，Esc 取消。" = "Clear all history? This does not delete repositories or .git/partial-resume state. Enter confirms; Esc cancels."
+        "删除这条历史记录？不会删除仓库本身。Enter 确定，Esc 取消。" = "Remove this history entry? The repository itself is not deleted. Enter confirms; Esc cancels."
+        "已清除全部历史记录。" = "Cleared all history."
+        "已删除该历史记录。" = "Removed that history entry."
+        "没有可清除的历史记录。" = "There is no history to clear."
+        " Enter 填入  ·  Del 删除  ·  Ctrl+D 清空  ·  Tab 返回  ·  Q 退出" = " Enter fill in  ·  Del delete  ·  Ctrl+D clear all  ·  Tab back  ·  Q quit"
         "暂无失败文件。" = "No failed files."
         " Enter 关闭  ·  Q 退出  ·  ? 帮助" = " Enter close  ·  Q quit  ·  ? help"
         " Ctrl+C 再按一次强制结束  ·  ? 帮助" = " Ctrl+C again to force stop  ·  ? help"
@@ -219,7 +265,14 @@ function Convert-GcrText {
         "↑↓ 选择选项，Enter 编辑或开始。每个选项的说明会显示在这一行。" = "Up/Down select; Enter edits or starts. The selected option's guide appears here."
         " Enter 关闭  ·  Q 退出  ·  ? 帮助" = " Enter close  ·  Q quit  ·  ? help"
         " Ctrl+C 再按一次强制结束  ·  ? 帮助" = " Ctrl+C again to force stop  ·  ? help"
+        " 最近任务  (Tab 切换  ·  Enter 填入  ·  Del 删除)" = " Recent tasks  (Tab switch  ·  Enter fill in  ·  Del delete)"
         " 最近任务  (Tab 切换  ·  Enter 填入)" = " Recent tasks  (Tab switch  ·  Enter fill in)"
+        "清空全部历史记录？不会删除仓库或 .git/partial-resume 进度。Enter 确定，Esc 取消。" = "Clear all history? This does not delete repositories or .git/partial-resume state. Enter confirms; Esc cancels."
+        "删除这条历史记录？不会删除仓库本身。Enter 确定，Esc 取消。" = "Remove this history entry? The repository itself is not deleted. Enter confirms; Esc cancels."
+        "已清除全部历史记录。" = "Cleared all history."
+        "已删除该历史记录。" = "Removed that history entry."
+        "没有可清除的历史记录。" = "There is no history to clear."
+        " Enter 填入  ·  Del 删除  ·  Ctrl+D 清空  ·  Tab 返回  ·  Q 退出" = " Enter fill in  ·  Del delete  ·  Ctrl+D clear all  ·  Tab back  ·  Q quit"
         " Enter 编辑/开始  ·  Space 开关  ·  ←→ 改批次  ·  Ctrl+V 粘贴  ·  Q 退出" = " Enter edit/start  ·  Space toggle  ·  Left/Right batch  ·  Ctrl+V paste  ·  Q quit"
         " Enter 确认  ·  Esc 取消  ·  Ctrl+V 粘贴" = " Enter confirm  ·  Esc cancel  ·  Ctrl+V paste"
         " Enter 确定退出  ·  Esc 返回" = " Enter confirm quit  ·  Esc back"
@@ -410,6 +463,8 @@ if (Test-Path -LiteralPath $script:GcrTuiFile) {
     function Wait-GcrTuiPaused { }
     function Show-GcrTuiResult { }
     function Save-GcrHistory { }
+    function Clear-GcrHistory { return 0 }
+    function Remove-GcrHistoryEntry { return $false }
 }
 
 if (-not $PSBoundParameters.ContainsKey("Language") -and (Get-Command Get-GcrLanguagePreference -ErrorAction SilentlyContinue)) {
@@ -480,6 +535,8 @@ function Show-Usage {
     Write-Host "  -NoTui                  Disable TUI (script/CI mode)"
     Write-Host "  -Language zh-CN|en-US   User interface language"
     Write-Host "  -ResumeLast             Resume the latest history entry"
+    Write-Host "  -ClearHistory           Clear local clone history (not repo progress)"
+    Write-Host "  -Version                Show git-clone-resume version"
     Write-Host "  -Help                   Show this help"
     Write-Host ""
     Write-Host "Interactive: run with no URL to open the TUI wizard."
@@ -490,6 +547,20 @@ function Show-Usage {
 if ($Help) {
     Show-Usage
     exit 0
+}
+
+if ($ClearHistory) {
+    if (Get-Command Clear-GcrHistory -ErrorAction SilentlyContinue) {
+        $n = Clear-GcrHistory
+        if ($n -gt 0) {
+            Write-Host (Convert-GcrText ("已清除全部历史记录。({0})" -f $n))
+        } else {
+            Write-Host (Convert-GcrText "没有可清除的历史记录。")
+        }
+        exit 0
+    }
+    Write-Host (Convert-GcrText "无法读取历史记录。")
+    exit 1
 }
 
 function Get-RepoFolderName {
@@ -602,7 +673,7 @@ function Invoke-GitProcess {
     try {
         [void]$proc.Start()
         $proc.StandardInput.Close()
-        $waitSlice = 80
+        $waitSlice = 16
         if (-not (Test-GcrTuiActive)) { $waitSlice = 500 }
         $waited = 0
         $hbSec = 2

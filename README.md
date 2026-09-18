@@ -1,6 +1,8 @@
+English documentation: [README.en.md](README.en.md).
+
 # Git 断点续传克隆（Windows）
 
-English documentation: [README.en.md](README.en.md). 启动向导时可选择语言，也可使用 `-Language en-US`；向导和克隆面板中按 `L` 可随时切换。
+ 启动向导时可选择语言，也可使用 `-Language en-US`；向导和克隆面板中按 `L` 可随时切换。
 
 针对 GitHub 等网络不稳定场景：先用 **partial clone** 只拉 commit/tree 元数据，再 **按批 checkout 文件**。中断后用同一条命令再跑即可续传。
 
@@ -97,6 +99,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1 https
 
 # 从本机历史恢复最近一次未完成的克隆
 .\git-clone-resume.ps1 -ResumeLast
+
+# 查看版本
+gcr -Version
+gcr --version
+
+# 清除本机克隆历史（不删除仓库或 .git/partial-resume 进度）
+gcr -ClearHistory
 ```
 
 完整帮助：`git-clone-resume.cmd -Help`
@@ -116,9 +125,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1 https
 | `?` / `H` | 帮助 |
 | `Enter` | 结束页关闭 |
 
-向导里：`Enter` 编辑或开始，`Space` 切换开关，`←` `→` 改批次大小，`Tab` 最近任务，`Ctrl+V` 粘贴 URL，`Q` 退出。高亮某一选项时，底栏上一行会显示该选项的简短说明（Guide）。
+向导里：`Enter` 编辑或开始，`Space` 切换开关，`←` `→` 改批次大小，`Tab` 最近任务，`Ctrl+V` 粘贴 URL，`Q` 退出。高亮某一选项时，底栏上一行会显示该选项的简短说明（Guide）。最近任务列表中：`Enter` 填入续传，`Del` 删除当前条目，`Ctrl+D` 清空全部历史。
 
-历史记录写在 `%LOCALAPPDATA%\git-clone-resume\history.json`。框线在中文控制台里若变宽，会自动改用 ASCII；也可设 `GCR_ASCII=1` 强制 ASCII。
+历史记录写在 `%LOCALAPPDATA%\git-clone-resume\history.json`。命令行可用 `-ClearHistory` 清空，不会删除目标仓库或 `.git/partial-resume/` 进度。框线在中文控制台里若变宽，会自动改用 ASCII；也可设 `GCR_ASCII=1` 强制 ASCII。
 
 ## 工作原理
 

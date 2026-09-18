@@ -596,6 +596,50 @@ function Get-GcrHistoryLast {
     return $items[0]
 }
 
+function Clear-GcrHistory {
+    $path = Get-GcrHistoryPath
+    $count = @(Get-GcrHistory).Count
+    try {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        return $count
+    } catch {
+        return 0
+    }
+}
+
+function Remove-GcrHistoryEntry {
+    param(
+        [string]$Url,
+        [string]$OutDir
+    )
+    $items = New-Object System.Collections.ArrayList
+    $removed = $false
+    foreach ($it in @(Get-GcrHistory)) {
+        $sameDir = ($OutDir -and $it.outDir -and ([string]$it.outDir -eq $OutDir))
+        $sameUrl = (-not $OutDir -and $Url -and $it.url -and ([string]$it.url -eq $Url))
+        if ($sameDir -or $sameUrl) {
+            $removed = $true
+            continue
+        }
+        [void]$items.Add($it)
+    }
+    if (-not $removed) { return $false }
+    $path = Get-GcrHistoryPath
+    try {
+        if ($items.Count -eq 0) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+            return $true
+        }
+        $json = ConvertTo-Json -InputObject @($items.ToArray()) -Depth 5
+        [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding $false))
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Save-GcrHistory {
     param(
         [string]$Url,
@@ -744,7 +788,7 @@ function Read-GcrTuiKey {
         $end = [Environment]::TickCount + $TimeoutMs
         while ([Environment]::TickCount -lt $end) {
             if ([Console]::KeyAvailable) { return [Console]::ReadKey($true) }
-            Start-Sleep -Milliseconds 20
+            Start-Sleep -Milliseconds 1
         }
     } catch { }
     return $null
@@ -865,8 +909,8 @@ function Invoke-GcrTuiTick {
     $ms = 1000
     try { $ms = ($now - $script:GcrTui.LastDraw).TotalMilliseconds } catch { $ms = 1000 }
     $anim = ($script:GcrTui.Phase -in @("fetch", "init", "list", "scan"))
-    $need = [bool]$Force -or [bool]$script:GcrTui.Dirty -or ($anim -and $ms -ge 250)
-    if ($need -and $ms -ge 50) {
+    $need = [bool]$Force -or [bool]$script:GcrTui.Dirty -or ($anim -and $ms -ge 80)
+    if ($need -and $ms -ge 16) {
         Render-GcrTui
         $script:GcrTui.Dirty = $false
         $script:GcrTui.LastDraw = $now
@@ -878,7 +922,7 @@ function Wait-GcrTuiPaused {
     if (-not (Test-GcrTuiActive)) { return }
     while ($script:GcrTui.Paused -and -not $script:GcrTui.QuitRequested) {
         Invoke-GcrTuiTick
-        Start-Sleep -Milliseconds 80
+        Start-Sleep -Milliseconds 16
     }
 }
 
@@ -904,6 +948,8 @@ function Get-GcrDashGuide {
 function Get-GcrWizardGuide {
     param($St)
     if ($St.ConfirmQuit) { return "退出向导？未开始的克隆不会写入进度。Enter 确定，Esc 取消。" }
+    if ($St.ConfirmClearAll) { return "清空全部历史记录？不会删除仓库或 .git/partial-resume 进度。Enter 确定，Esc 取消。" }
+    if ($St.ConfirmClearOne) { return "删除这条历史记录？不会删除仓库本身。Enter 确定，Esc 取消。" }
     if ($St.Edit) { return "正在编辑。Enter 确认，Esc 取消，Ctrl+V 粘贴。光标用 ← → Home End。" }
     if ($St.Focus -eq "recent") { return "最近任务。Enter 填入 URL/目录/分支，可直接续传未完成的克隆。" }
     $items = Get-GcrWizardItems -St $St
@@ -978,6 +1024,9 @@ function Render-GcrTui {
 
     Push-GcrBorder "top"
     $title = " git-clone-resume"
+    if (Get-Command Get-GcrVersion -ErrorAction SilentlyContinue) {
+        try { $title = $title + " v" + (Get-GcrVersion) } catch { }
+    }
     $sub = $badge + " "
     Push-GcrRow -Left ($title) -Right $sub -Color ($c.B + $c.C)
     Push-GcrBorder "mid"
@@ -1152,14 +1201,14 @@ function Show-GcrTuiResult {
     Render-GcrTui
     $waited = 0
     while ($waited -lt 3600000) {
-        $k = Read-GcrTuiKey -TimeoutMs 200
+        $k = Read-GcrTuiKey -TimeoutMs 16
         if ($null -ne $k) {
             if ($k.Key -eq "Enter" -or $k.Key -eq "Q" -or $k.Key -eq "Escape" -or (Test-GcrCtrlKey $k "C")) {
                 break
             }
             if ($k.KeyChar -eq "?") { $script:GcrTui.Help = -not $script:GcrTui.Help; Render-GcrTui }
         }
-        $waited += 200
+        $waited += 16
         $size = Get-GcrTuiSize
         if ($size.W -ne $script:GcrTui.Width -or $size.H -ne $script:GcrTui.Height) {
             $script:GcrTui.LastFrame = @()
@@ -1314,8 +1363,14 @@ function Render-GcrTuiWizard {
 
     $items = Get-GcrWizardItems -St $St
     WBorder "top"
+    $ver = ""
+    if (Get-Command Get-GcrVersion -ErrorAction SilentlyContinue) {
+        try { $ver = "v" + (Get-GcrVersion) } catch { $ver = "" }
+    }
     WRow " git-clone-resume" ($c.B + $c.C)
-    WRow " 断点续传克隆  ·  partial clone + 按批 checkout" $c.D
+    $sub = " 断点续传克隆  ·  partial clone + 按批 checkout"
+    if ($ver) { $sub = $sub + "  " + $ver }
+    WRow $sub $c.D
     WBorder "mid"
 
     $formEnd = 12
@@ -1368,7 +1423,7 @@ function Render-GcrTuiWizard {
             $St.RecentTop = $recentTop
         }
     }
-    $recentTitle = " 最近任务  (Tab 切换  ·  Enter 填入)"
+    $recentTitle = " 最近任务  (Tab 切换  ·  Enter 填入  ·  Del 删除)"
     if ($recent.Count -gt $recentSlots) {
         $visibleEnd = [Math]::Min($recent.Count, $recentTop + $recentSlots)
         $recentTitle = $recentTitle + ("  [{0}-{1}/{2}]" -f ($recentTop + 1), $visibleEnd, $recent.Count)
@@ -1407,11 +1462,15 @@ function Render-GcrTuiWizard {
     if ($St.Error) { $guide = [string]$St.Error }
     $guideColor = $c.C
     if ($St.Error) { $guideColor = $c.E }
-    if ($St.ConfirmQuit) { $guideColor = $c.Y }
+    if ($St.ConfirmQuit -or $St.ConfirmClearAll -or $St.ConfirmClearOne) { $guideColor = $c.Y }
     WRow (" " + $guide) $guideColor
     $foot = " Enter 编辑/开始  ·  Space 开关  ·  ←→ 改批次  ·  Ctrl+V 粘贴  ·  Q 退出"
     if ($St.Edit) { $foot = " Enter 确认  ·  Esc 取消  ·  Ctrl+V 粘贴" }
     if ($St.ConfirmQuit) { $foot = " Enter 确定退出  ·  Esc 返回" }
+    if ($St.ConfirmClearAll -or $St.ConfirmClearOne) { $foot = " Enter 确定  ·  Esc 取消" }
+    if ($St.Focus -eq "recent" -and -not $St.ConfirmQuit -and -not $St.ConfirmClearAll -and -not $St.ConfirmClearOne -and -not $St.Edit) {
+        $foot = " Enter 填入  ·  Del 删除  ·  Ctrl+D 清空  ·  Tab 返回  ·  Q 退出"
+    }
     WRow $foot $c.D
     WBorder "bot"
     while ($lines.Count -gt $h) { $lines.RemoveAt($lines.Count - 1) }
@@ -1497,9 +1556,11 @@ function Show-GcrTuiWizard {
         EditField    = ""
         Recent       = @(Get-GcrHistory)
         Scroll       = 0
-        ConfirmQuit  = $false
-        Error        = ""
-        Help         = $false
+        ConfirmQuit     = $false
+        ConfirmClearAll = $false
+        ConfirmClearOne = $false
+        Error           = ""
+        Help            = $false
     }
     if ($Defaults -and $Defaults.ContainsKey("Verify")) { $st.Verify = [bool]$Defaults.Verify }
     if ($Defaults -and $Defaults.ContainsKey("ForceRefetch")) { $st.ForceRefetch = [bool]$Defaults.ForceRefetch }
@@ -1533,13 +1594,45 @@ function Show-GcrTuiWizard {
             Render-GcrTuiWizard -St $st
             $dirty = $false
         }
-        $k = Read-GcrTuiKey -TimeoutMs 250
+        $k = Read-GcrTuiKey -TimeoutMs 16
         if ($null -eq $k) { continue }
         $dirty = $true
 
         if ($st.ConfirmQuit) {
             if ($k.Key -eq "Enter" -or $k.Key -eq "Y" -or $k.Key -eq "Q") { return $null }
             $st.ConfirmQuit = $false
+            continue
+        }
+        if ($st.ConfirmClearAll) {
+            if ($k.Key -eq "Enter" -or $k.Key -eq "Y") {
+                $n = Clear-GcrHistory
+                $st.Recent = @()
+                $st.RecentSel = 0
+                $st.RecentTop = 0
+                $st.Focus = "form"
+                if ($n -gt 0) { $st.Error = "已清除全部历史记录。" }
+                else { $st.Error = "没有可清除的历史记录。" }
+            }
+            $st.ConfirmClearAll = $false
+            continue
+        }
+        if ($st.ConfirmClearOne) {
+            if ($k.Key -eq "Enter" -or $k.Key -eq "Y") {
+                if ($st.Recent.Count -gt 0 -and $st.RecentSel -ge 0 -and $st.RecentSel -lt $st.Recent.Count) {
+                    $item = $st.Recent[$st.RecentSel]
+                    $urlDel = ""
+                    $dirDel = ""
+                    try { $urlDel = [string]$item.url } catch { }
+                    try { $dirDel = [string]$item.outDir } catch { }
+                    if (Remove-GcrHistoryEntry -Url $urlDel -OutDir $dirDel) {
+                        $st.Recent = @(Get-GcrHistory)
+                        if ($st.RecentSel -ge $st.Recent.Count) { $st.RecentSel = [Math]::Max(0, $st.Recent.Count - 1) }
+                        if ($st.Recent.Count -eq 0) { $st.Focus = "form" }
+                        $st.Error = "已删除该历史记录。"
+                    }
+                }
+            }
+            $st.ConfirmClearOne = $false
             continue
         }
         if ($st.Edit) {
@@ -1591,6 +1684,11 @@ function Show-GcrTuiWizard {
         }
 
         if (Test-GcrCtrlKey $k "C") { $st.ConfirmQuit = $true; continue }
+        if (Test-GcrCtrlKey $k "D") {
+            if ($st.Recent.Count -gt 0) { $st.ConfirmClearAll = $true }
+            else { $st.Error = "没有可清除的历史记录。" }
+            continue
+        }
         if (Test-GcrCtrlKey $k "V" -and $st.Focus -eq "form") {
             $paste = Get-GcrClipboardText
             if (Test-GcrRepoUrlText $paste) {
@@ -1603,6 +1701,11 @@ function Show-GcrTuiWizard {
         switch ($k.Key.ToString()) {
             "Q" { $st.ConfirmQuit = $true }
             "Escape" { $st.ConfirmQuit = $true }
+            "Delete" {
+                if ($st.Focus -eq "recent" -and $st.Recent.Count -gt 0) { $st.ConfirmClearOne = $true }
+                elseif ($st.Recent.Count -gt 0) { $st.ConfirmClearAll = $true }
+                else { $st.Error = "没有可清除的历史记录。" }
+            }
             "Tab" {
                 if ($st.Focus -eq "form") { $st.Focus = "recent"; if ($st.Recent.Count -eq 0) { $st.Focus = "form" } }
                 else { $st.Focus = "form" }
@@ -1749,7 +1852,7 @@ function Show-GcrTuiWizard {
                 if ($k.KeyChar -eq "?") { $st.Error = "Enter 编辑 · Space 开关 · Tab 最近任务 · S 开始 · Q 退出" }
             }
         }
-        if ($k.Key -ne "Enter") { $st.Error = "" }
+        if ($k.Key -ne "Enter" -and $k.Key -ne "Delete" -and -not (Test-GcrCtrlKey $k "D")) { $st.Error = "" }
     }
     return $null
 }
