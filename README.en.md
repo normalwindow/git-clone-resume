@@ -57,7 +57,26 @@ On the first wizard screen, select `Language` and choose Chinese or English. Pre
 
 Progress is stored outside the worktree in `.git/partial-resume/`. Do not delete the target repository's `.git` directory. Completed files are skipped on subsequent runs; failed files are retried.
 
+File contents (blobs) are fetched on purpose, in one batched request per group, instead of letting `git checkout` trigger git's implicit lazy fetch (which fetches one blob per subprocess and then still reports `error: unable to read sha1 file of <path> (<oid>)` with exit 255 for that same process). A failing git command never means the whole group failed: only the files that did not land are fetched and retried, bisected when needed.
+
 The tool skips submodule gitlinks. Run it separately for submodules. After checking out Git LFS files, run `git lfs pull` if actual LFS content is needed.
+
+## Window / tab title
+
+While a clone runs the console title is rewritten so the taskbar, Windows Terminal tabs, and the VS Code terminal list show live progress (works in TUI and `-NoTui`):
+
+```
+nature-skills  ·  42% (340/802)  ·  git-clone-resume
+nature-skills  ·  42% (340/802)  ·  PAUSED  ·  git-clone-resume
+nature-skills  ·  99% (799/802)  ·  FAILED 3  ·  git-clone-resume
+nature-skills  ·  done (802/802)  ·  git-clone-resume
+```
+
+Phases show as `fetching metadata` / `listing files` / `scanning workspace` / `repairing index`. The previous title is restored on exit. Control it with `GCR_TITLE=1` (force, also when output is redirected) or `GCR_TITLE=0` (disable).
+
+## Result panel colors
+
+When a run finishes, the result panel is colored by meaning instead of a single dim block: the headline is bold (green on success, red on failure), the `Succeeded …` summary is bold green, `Failure list: …` is yellow, workspace paths are cyan, and hints stay dim. Switching to English (`-Language en-US`) now also applies to this panel and to the log summaries, with no leftover full-width punctuation.
 
 ## TUI Keys
 

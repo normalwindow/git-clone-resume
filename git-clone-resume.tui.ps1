@@ -103,6 +103,22 @@ function Get-GcrLevelColor {
     }
 }
 
+# Classify a result-panel line so the dashboard can colour it by meaning:
+# paths in cyan, success in green, failures in yellow/red, hints dim.
+function Get-GcrResultLineKind {
+    param([string]$Text)
+    $t = [string]$Text
+    if ([string]::IsNullOrWhiteSpace($t)) { return "info" }
+    if ($t -match "^(工作区|Workspace|仓库目录|Repository directory|清单文件|List file)") { return "path" }
+    # A summary line that reports failures must not look like a success line.
+    if ($t -match "(失败|failed)\s+[1-9][0-9]*") { return "warn" }
+    if ($t -match "成功|Succeeded|全部文件已就绪|All files are ready|克隆完成|Clone complete|文件: |Files: |DryRun 完成|DryRun complete") { return "ok" }
+    if ($t -match "失败列表|Failure list|部分文件失败|Some files failed|仍失败|Still failed|FAILED|failed [1-9]") { return "warn" }
+    if ($t -match "再次运行|Run the same command|重试|retry") { return "dim" }
+    if ($t -match "失败|failed|错误|Error|出错") { return "err" }
+    return "info"
+}
+
 function Test-GcrTuiAvailable {
     if ($Host.Name -match "ISE") { return $false }
     try {
@@ -330,6 +346,7 @@ function Initialize-GcrTuiState {
         Tick          = 0
         Screen        = "dash"
         ErrorFlash    = ""
+        Sha1Noise     = 0
     }
 }
 
@@ -351,7 +368,13 @@ function Initialize-GcrTui {
     $box = Resolve-GcrBox
     $script:GcrTui.Box = $box
     $script:GcrTui.UseUnicode = ($box.H -ne "-")
-    try { [Console]::Title = "git-clone-resume" } catch { }
+    # Title is owned by git-clone-resume.ps1 (Set-GcrWindowTitle) so it can be
+    # restored on every exit path; fall back to a direct set if unavailable.
+    if (Get-Command Set-GcrWindowTitle -ErrorAction SilentlyContinue) {
+        Set-GcrWindowTitle -Text "git-clone-resume"
+    } else {
+        try { [Console]::Title = "git-clone-resume" } catch { }
+    }
     $script:GcrTui.Active = $true
     $script:GcrTui.Dirty = $true
     $script:GcrTui.LastFrame = @()
@@ -361,6 +384,7 @@ function Initialize-GcrTui {
 function Close-GcrTui {
     if ($null -eq $script:GcrTui -or -not $script:GcrTui.Active) {
         $script:GcrTui = $null
+        if (Get-Command Restore-GcrWindowTitle -ErrorAction SilentlyContinue) { Restore-GcrWindowTitle }
         return
     }
     $e = $script:GcrEsc
@@ -372,9 +396,13 @@ function Close-GcrTui {
     try { [Console]::TreatControlCAsInput = $script:GcrOrigTreatCtrlC } catch {
         try { [Console]::TreatControlCAsInput = $false } catch { }
     }
-    try {
-        if ($script:GcrOrigTitle) { [Console]::Title = $script:GcrOrigTitle }
-    } catch { }
+    if (Get-Command Restore-GcrWindowTitle -ErrorAction SilentlyContinue) {
+        Restore-GcrWindowTitle
+    } else {
+        try {
+            if ($script:GcrOrigTitle) { [Console]::Title = $script:GcrOrigTitle }
+        } catch { }
+    }
     Restore-GcrVt
     $script:GcrTui.Active = $false
     $script:GcrTui = $null
@@ -408,10 +436,15 @@ function Set-GcrTuiRepo {
 
 function Set-GcrTuiPhase {
     param([string]$Name, [string]$Detail = "")
+    # Runs before the TUI check so script (-NoTui) runs also update the title.
+    if ($Name -and (Get-Command Update-GcrWindowTitle -ErrorAction SilentlyContinue)) {
+        Update-GcrWindowTitle -State $Name
+    }
     if (-not (Test-GcrTuiActive)) { return }
     if ($Name) { $script:GcrTui.Phase = $Name }
     if ($PSBoundParameters.ContainsKey("Detail")) { $script:GcrTui.PhaseDetail = $Detail }
     $script:GcrTui.Dirty = $true
+    Sync-GcrTuiWindowTitle
 }
 
 function Add-GcrTuiLog {
@@ -453,6 +486,14 @@ function Add-GcrGitOutput {
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
     $t = $Text.Trim()
     if ($t.Length -eq 0) { return }
+    # A cold batch prints one "unable to read sha1 file of <path> (<oid>)" per
+    # missing blob. That is expected (the caller fetches those blobs and then
+    # logs a single summary including the first line and the count), so flooding
+    # the activity log with them just hides everything else.
+    if ($t -match "unable to read sha1 file of") {
+        $script:GcrTui.Sha1Noise = [int]$script:GcrTui.Sha1Noise + 1
+        return
+    }
     if ($t -match "(\d+)\s*%") {
         $script:GcrTui.GitPercent = [int]$Matches[1]
         $script:GcrTui.PhaseDetail = $t
@@ -525,10 +566,27 @@ function Update-GcrTuiProgress {
         $state = 1
     }
     Set-GcrTuiTabProgress -Percent $pct -State $state
-    try {
-        $short = Truncate-GcrDisplay -Text $script:GcrTui.RepoUrl -Width 40
-        [Console]::Title = ("git-clone-resume {0}% {1}" -f $pct, $short)
-    } catch { }
+    Sync-GcrTuiWindowTitle
+}
+
+# Keep the taskbar / tab title in step with the dashboard (repo, progress, state).
+# The heavy lifting lives in git-clone-resume.ps1 so -NoTui mode gets it too.
+function Sync-GcrTuiWindowTitle {
+    if (-not (Get-Command Update-GcrWindowTitle -ErrorAction SilentlyContinue)) { return }
+    if (-not (Test-GcrTuiActive)) { return }
+    # Only override the phase for these terminal states. Anything else keeps the
+    # phase picked by Set-GcrTuiPhase, otherwise every progress tick would
+    # replace "scanning workspace" / "42%" with a bare "run".
+    $state = ""
+    if ($script:GcrTui.Status -eq "done") { $state = "done" }
+    elseif ($script:GcrTui.Status -eq "error") { $state = "error" }
+    elseif ($script:GcrTui.QuitRequested) { $state = "stopped" }
+    elseif ($script:GcrTui.Paused) { $state = "paused" }
+    if ($state) {
+        Update-GcrWindowTitle -State $state -Ok $script:GcrTui.Ok -Total $script:GcrTui.Total -Fail $script:GcrTui.Fail
+    } else {
+        Update-GcrWindowTitle -Ok $script:GcrTui.Ok -Total $script:GcrTui.Total -Fail $script:GcrTui.Fail
+    }
 }
 
 function Get-GcrHistoryPath {
@@ -827,15 +885,18 @@ function Invoke-GcrTuiKey {
         "P" {
             $script:GcrTui.Paused = -not $script:GcrTui.Paused
             $script:GcrTui.Dirty = $true
+            Sync-GcrTuiWindowTitle
         }
         "Escape" {
             if ($script:GcrTui.FailView) { $script:GcrTui.FailView = $false }
             else { $script:GcrTui.Paused = -not $script:GcrTui.Paused }
             $script:GcrTui.Dirty = $true
+            Sync-GcrTuiWindowTitle
         }
         "Spacebar" {
             if ($script:GcrTui.Paused) { $script:GcrTui.Paused = $false }
             $script:GcrTui.Dirty = $true
+            Sync-GcrTuiWindowTitle
         }
         "H" { $script:GcrTui.Help = $true; $script:GcrTui.Dirty = $true }
         "L" {
@@ -886,6 +947,7 @@ function Request-GcrTuiQuit {
         $script:GcrTui.Paused = $false
     }
     $script:GcrTui.Dirty = $true
+    Sync-GcrTuiWindowTitle
 }
 
 function Invoke-GcrTuiTick {
@@ -1095,8 +1157,26 @@ function Render-GcrTui {
 
         $bodyLines = New-Object System.Collections.ArrayList
         if ($script:GcrTui.Screen -eq "result" -and @($script:GcrTui.ResultBody).Count -gt 0) {
+            # Result panel: headline in bold green/red, body lines coloured by
+            # meaning (success / failure / path / hint) instead of uniform dim.
+            $headline = [string]$script:GcrTui.ResultTitle
+            if ($headline) {
+                $headColor = $c.G
+                if ($script:GcrTui.Status -eq "error") { $headColor = $c.E }
+                [void]$bodyLines.Add(@{ L = "R"; M = $headline; T = $null; C = ($c.B + $headColor) })
+                [void]$bodyLines.Add(@{ L = "R"; M = ""; T = $null; C = $c.D })
+            }
             foreach ($b in @($script:GcrTui.ResultBody)) {
-                [void]$bodyLines.Add(@{ L = "INFO"; M = [string]$b; T = $null })
+                $kind = Get-GcrResultLineKind -Text ([string]$b)
+                $col = $c.W
+                switch ($kind) {
+                    "ok"   { $col = ($c.B + $c.G) }
+                    "warn" { $col = $c.Y }
+                    "err"  { $col = $c.E }
+                    "path" { $col = $c.C }
+                    "dim"  { $col = $c.D }
+                }
+                [void]$bodyLines.Add(@{ L = "R"; M = [string]$b; T = $null; C = $col })
             }
         } elseif ($script:GcrTui.Help) {
             foreach ($b in @(
@@ -1145,7 +1225,13 @@ function Render-GcrTui {
             $lvl = [string]$item.L
             if (-not $lvl) { $lvl = "INFO" }
             $text = $prefix + $item.M
-            Push-GcrRow -Left (" " + $text) -Color (Get-GcrLevelColor $lvl)
+            $rowColor = Get-GcrLevelColor $lvl
+            if ($item.ContainsKey("C")) {
+                # per-line override (result panel, where the level is not enough)
+                $customColor = [string]$item.C
+                if ($customColor) { $rowColor = $customColor }
+            }
+            Push-GcrRow -Left (" " + $text) -Color $rowColor
         }
     }
 
@@ -1189,6 +1275,7 @@ function Show-GcrTuiResult {
     $script:GcrTui.ResultBody = @($Body)
     $script:GcrTui.Help = $false
     $script:GcrTui.Paused = $false
+    Sync-GcrTuiWindowTitle
     Add-GcrTuiLog -Level $(if ($Kind -eq "done") { "OK" } else { "ERROR" }) -Message $Title
     $script:GcrTui.Dirty = $true
     $pct = 100

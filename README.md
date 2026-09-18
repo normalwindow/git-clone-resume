@@ -110,6 +110,24 @@ gcr -ClearHistory
 
 完整帮助：`git-clone-resume.cmd -Help`
 
+### 任务栏 / 标签页标题
+
+克隆过程中会自动改写控制台标题，任务栏、Windows Terminal 标签页、VS Code 终端列表都能直接看到进度（TUI 与 `-NoTui` 都生效）：
+
+```
+nature-skills  ·  42% (340/802)  ·  git-clone-resume
+nature-skills  ·  42% (340/802)  ·  PAUSED  ·  git-clone-resume
+nature-skills  ·  99% (799/802)  ·  FAILED 3  ·  git-clone-resume
+nature-skills  ·  done (802/802)  ·  git-clone-resume
+```
+
+阶段阶段会显示 `fetching metadata` / `listing files` / `scanning workspace` / `repairing index`。
+脚本退出时会恢复原来的标题。需要开关时设环境变量：`GCR_TITLE=1` 强制启用（输出被重定向时也用），`GCR_TITLE=0` 禁用。
+
+### 结束页配色
+
+克隆结束后结果面板按语义着色，不再是一整块暗色：标题加粗（完成绿 / 失败红），`成功 802/802，失败 0，耗时 …` 为绿色加粗，`失败列表: …` 为黄色，工作区路径为青色，提示行为暗色。
+
 ### TUI 快捷键
 
 克隆过程中（底栏会随阶段切换提示）：
@@ -129,15 +147,19 @@ gcr -ClearHistory
 
 历史记录写在 `%LOCALAPPDATA%\git-clone-resume\history.json`。命令行可用 `-ClearHistory` 清空，不会删除目标仓库或 `.git/partial-resume/` 进度。框线在中文控制台里若变宽，会自动改用 ASCII；也可设 `GCR_ASCII=1` 强制 ASCII。
 
+界面语言切换（`-Language en-US` 或向导里选 English）现在对结束页也生效：`Workspace: …` / `Succeeded 802/802   failed 0   elapsed 00:00:37`，日志里的失败汇总同样会切成英文且不会残留全角标点。
+
 ## 工作原理
 
 1. `git init` + `remote.origin.partialclonefilter=blob:none`（不直接 `git clone`，这样元数据 fetch 失败也可重试）
 2. `git fetch --filter=blob:none origin <ref>` 只拉 commit / tree
 3. 把 HEAD 钉在该 commit SHA 上，避免中途远端更新导致续传错位
 4. `git ls-tree -r` 得到文件清单（**不用 -l**，否则 blob:none 会为了拿 size 把全部 blob 拉下来；也不用 `-z`，PowerShell 5.1 会把 NUL 截断）
-5. 分批 `git checkout <sha> -- file1 file2 ...`，由 promisor remote 按需拉 blob
+5. 分批处理：先 `git checkout <sha> -- file1 file2 ...`（带 `GIT_NO_LAZY_FETCH=1`，只做本地操作），核对哪些没落盘，再用 `git fetch origin <blob-oid>...` 把缺的 blob 一次性拉下来并重试这些文件（必要时二分定位）
 6. 成功的路径追加写入 `.git/partial-resume/done.txt`
-7. 再次运行：跳过已落盘文件。整批 checkout 失败立刻拆成单文件（单文件才指数退避）。结束时修复 Windows 上被弄乱的 git index
+7. 再次运行：跳过已落盘文件。命令失败不等于整批失败，只重试真正缺的（必要时二分定位）；结束时修复 Windows 上被弄乱的 git index
+
+> 为什么不让 git 自己在 checkout 里按需拉 blob：在 `blob:none` 的 partial clone 上，git 会为每个缺失 blob 单独起一次 fetch 子进程，而且哪怕对象已经拿到，同一个进程仍会报 `error: unable to read sha1 file of <path> (<oid>)` 并以 255 退出；重跑一次才会成功。因此本脚本自己按批拉取 blob，再让 checkout 变成纯本地操作。
 
 进度目录（不会进工作区）：
 
@@ -154,7 +176,8 @@ gcr -ClearHistory
 
 - 目录已存在时续传，不会因为 `git clone` 到一半而从头失败
 - 元数据 fetch 与 blob checkout 都有重试 / 指数退避
-- 批次 checkout；整批失败立刻拆成单文件，避免同一批重试十几次（sha1 missing / Directory not empty）
+- blob 按需拉取自己做（`git fetch origin <oid>...`，与 git 的 lazy fetch 等价，但一次请求拉一批），不在 checkout 里一个文件一个请求地懒加载
+- 命令失败不等于整批失败：只补拉 / 重试真正缺的文件，必要时二分定位，避免因一个文件重跑整批（sha1 missing / Directory not empty）
 - Windows 长路径、`http.version=HTTP/1.1`、低速断开、UTF-8 路径、`index.lock` 清理
 - 跳过 submodule gitlink；可用 `-Include` / `-Exclude` 过滤
 - Ctrl+C 或断电后重跑同一命令即可，不需要手动改文件列表
@@ -163,6 +186,7 @@ gcr -ClearHistory
 ## 注意事项
 
 - **不要**删掉目标目录里的 `.git`，否则进度和已下 blob 都没了。
+- 日志里看到 `error: unable to read sha1 file of <path> (<oid>)` 不必慌：这说明该 blob 本地缺失，脚本会先把缺的批量拉下来再重试这些文件。只有该对象在远端也已不存在（force push、仓库被裁剪等）时，对应文件才会进 `failed.txt`。
 - 私有仓库走本机已有的凭据即可（Git Credential Manager / `gh auth` / SSH key）。
 - 子模块不会自动递归；要对子模块再执行一次本脚本。
 - Git LFS 文件 checkout 后如需真正指针内容，请再执行 `git lfs pull`。

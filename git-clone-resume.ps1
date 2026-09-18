@@ -26,7 +26,7 @@
     单次 git 命令行参数最大字符数，避免超过 Windows 限制。默认 6000。
 
 .PARAMETER MaxRetries
-    单个批次/文件失败后的最大重试次数。默认 8。
+    单个文件 checkout / 按需拉取 blob 失败后的最大重试次数。默认 8。
 
 .PARAMETER RetryDelaySeconds
     首次重试等待秒数，之后指数退避（封顶 60 秒）。默认 2。
@@ -152,7 +152,7 @@ $script:GcrVersion = $null
 
 function Get-GcrVersion {
     if ($script:GcrVersion) { return [string]$script:GcrVersion }
-    $fallback = "0.1.4"
+    $fallback = "0.1.5"
     try {
         $root = $PSScriptRoot
         if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -330,10 +330,12 @@ function Convert-GcrText {
     $translations = @{}
     foreach ($key in $full.Keys) { $translations[$key] = [string]$full[$key] }
     foreach ($key in $specific.Keys) { $translations[$key] = [string]$specific[$key] }
-    foreach ($key in @($translations.Keys | Sort-Object Length -Descending)) {
-        $Text = $Text.Replace($key, $translations[$key])
-    }
+    # NB: rules are applied later, all together, longest source string first.
+    # Translating eagerly here let short entries win over long phrases
+    # ("停止" before "已由用户停止。") and produced mixed output such as
+    # "已由用户stop.Rrun the same command again to resume.".
     $pairs = @(
+        @("成功 ", "Succeeded "), @("，失败 ", "  failed "), @("，耗时 ", "  elapsed "),
         @("未找到 git。请先安装 Git for Windows", "Git was not found. Install Git for Windows"),
         @("错误:", "Error:"), @("必须提供仓库 URL。", "A repository URL is required."),
         @("无法读取历史记录。", "Could not read history."),
@@ -369,6 +371,9 @@ function Convert-GcrText {
         @("远程仓库地址，支持 https、ssh、git@ 以及本地路径。Ctrl+V 从剪贴板粘贴。", "Remote repository URL. Supports https, ssh, git@, and local paths. Ctrl+V pastes from the clipboard."),
         @("工作区目录。留空则用仓库名。已有 .git/partial-resume 时自动续传。", "Workspace directory. Leave empty to use the repository name. Existing .git/partial-resume state resumes automatically."),
         @("选择界面语言。可随时按 L 在中文和英文之间切换。", "Interface language. Press L at any time to switch between Chinese and English."),
+        @("（再次运行本脚本会重试未完成文件）", " (rerun this script to retry the unfinished files)"),
+        @("，工作区已存在 ", ", already on disk "), @("，剩余 ", ", remaining "),
+        @("（8 个文件）", " (8 files)"),
         @("最近任务", "Recent tasks"), @("切换", "switch"), @("填入", "fill in"), @("无。完成一次克隆后会出现在这里", "None. Completed clones appear here"),
         @("Enter 编辑/开始", "Enter edit/start"), @("Space 开关", "Space toggle"), @("改批次", "change batch"), @("粘贴", "paste"), @("退出", "quit"),
         @("按上面的设置开始或继续克隆。Enter 启动。中断后重跑即可续传。", "Start or resume with the settings above. Press Enter to begin; rerun after interruption."),
@@ -395,7 +400,6 @@ function Convert-GcrText {
         @("修复 Windows 上可能被弄乱的 git index。", "Repair the Git index if Windows left it inconsistent."),
         @("Q 停止  ·  P 暂停  ·  ? 帮助", "Q stop  ·  P pause  ·  ? help")
     )
-    $result = $Text
     $direct = [ordered]@{
         "断点续传克隆" = "Resumable clone"
         "按批 checkout" = "batch checkout"
@@ -419,7 +423,11 @@ function Convert-GcrText {
         "Q 退出" = "Q quit"
         "Language" = "Language"
     }
-    foreach ($key in $direct.Keys) { $result = $result.Replace($key, [string]$direct[$key]) }
+    # Single pass over every rule, longest source first, so a phrase is never
+    # half-translated by a shorter entry it contains.
+    $ruleMap = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($key in $translations.Keys) { $ruleMap[[string]$key] = [string]$translations[$key] }
+    foreach ($key in $direct.Keys) { $ruleMap[[string]$key] = [string]$direct[$key] }
     $items = @($pairs)
     for ($i = 0; $i -lt $items.Count;) {
         if ($items[$i] -is [array] -and @($items[$i]).Count -ge 2) {
@@ -433,8 +441,32 @@ function Convert-GcrText {
         } else {
             break
         }
-        if (-not [string]::IsNullOrEmpty($from)) { $result = $result.Replace($from, $to) }
+        if (-not [string]::IsNullOrEmpty($from)) { $ruleMap[$from] = $to }
     }
+    # A source string that ends a sentence needs a separating space on the
+    # English side, otherwise the next sentence glues on (the "。" is consumed
+    # by the rule itself, so the cleanup below cannot see it any more).
+    foreach ($k in @($ruleMap.Keys)) {
+        $ks = [string]$k
+        $vs = [string]$ruleMap[$k]
+        if ($ks.EndsWith("。") -and $vs -and -not $vs.EndsWith(" ")) {
+            $ruleMap[$k] = $vs + " "
+        }
+    }
+    $result = $Text
+    foreach ($key in @($ruleMap.Keys | Sort-Object { $_.Length } -Descending)) {
+        if (-not [string]::IsNullOrEmpty($key)) { $result = $result.Replace([string]$key, [string]$ruleMap[$key]) }
+    }
+    # Last pass: Chinese punctuation left over by any rule would look odd in
+    # English output ("Succeeded 40/40 ，failed 0" -> ", failed 0").
+    # "。" before a non-space also needs a separating space, otherwise adjacent
+    # sentences glue together ("Stopped by user.Run the same command again").
+    $result = [regex]::Replace($result, "。(?=\S)", ". ")
+    $result = $result.Replace("。", ". ")
+    $result = $result.Replace(" ，", ", ").Replace("，", ", ")
+    $result = $result.Replace(" , ", ", ").Replace(" . ", ". ")
+    $result = $result.Replace("（", " (").Replace("）", ")").Replace("）", ")")
+    $result = $result.Replace("、", ", ")
     return $result
 }
 
@@ -453,7 +485,10 @@ if (Test-Path -LiteralPath $script:GcrTuiFile) {
     function Write-GcrNewline { Write-Host "" }
     function Initialize-GcrTui { return $false }
     function Close-GcrTui { }
-    function Set-GcrTuiPhase { }
+    function Set-GcrTuiPhase {
+        param([string]$Name, [string]$Detail = "")
+        if ($Name) { Update-GcrWindowTitle -State $Name }
+    }
     function Set-GcrTuiRepo { }
     function Update-GcrTuiProgress { }
     function Add-GcrTuiLog { }
@@ -513,6 +548,115 @@ function Write-Log {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Window / tab title
+# ---------------------------------------------------------------------------
+# The taskbar, Windows Terminal tabs and the VS Code terminal list all display
+# [Console]::Title. Keep it informative while a clone runs - in TUI *and* in
+# -NoTui mode:  "<repo>  ·  42% (340/802)  ·  git-clone-resume".
+$script:GcrTitleSaved = $false
+$script:GcrTitleOriginal = $null
+$script:GcrTitleCurrent = $null
+$script:GcrTitleRepoName = ""
+$script:GcrTitleState = ""
+$script:GcrTitleEnabled = $false
+try {
+    $script:GcrTitleEnabled = [bool][Environment]::UserInteractive
+    if ([Console]::IsOutputRedirected) { $script:GcrTitleEnabled = $false }
+    $titlePreference = [string]$env:GCR_TITLE
+    if ($titlePreference -eq "1") { $script:GcrTitleEnabled = $true }
+    elseif ($titlePreference -eq "0") { $script:GcrTitleEnabled = $false }
+} catch { $script:GcrTitleEnabled = $false }
+
+function Set-GcrWindowTitle {
+    param([string]$Text)
+    if (-not $script:GcrTitleEnabled) { return }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    if (-not $script:GcrTitleSaved) {
+        $script:GcrTitleSaved = $true
+        try { $script:GcrTitleOriginal = [string][Console]::Title } catch { $script:GcrTitleOriginal = $null }
+    }
+    if ($script:GcrTitleCurrent -eq $Text) { return }
+    $script:GcrTitleCurrent = $Text
+    try { [Console]::Title = $Text } catch { }
+}
+
+function Restore-GcrWindowTitle {
+    if (-not $script:GcrTitleSaved) { return }
+    $script:GcrTitleSaved = $false
+    $script:GcrTitleCurrent = $null
+    if (-not $script:GcrTitleEnabled) { return }
+    try {
+        if ($script:GcrTitleOriginal) { [Console]::Title = $script:GcrTitleOriginal }
+    } catch { }
+}
+
+# State: run | init | fetch | list | scan | download | repair | paused | done | error | stopped
+# A call without -State keeps the last phase, so progress-only updates (which
+# happen far more often) still render with the right label - e.g. during the
+# workspace scan the title shows "scanning workspace (42/120)" instead of a
+# percentage that would jump to 100% and then fall back to 0%.
+function Update-GcrWindowTitle {
+    param(
+        [string]$State = "",
+        [int]$Ok = -1,
+        [int]$Total = -1,
+        [int]$Fail = -1
+    )
+    if (-not $script:GcrTitleEnabled) { return }
+    if ($State) { $script:GcrTitleState = $State }
+    elseif ($script:GcrTitleState) { $State = $script:GcrTitleState }
+    else { $State = "run" }
+    $pct = -1
+    if ($Total -gt 0 -and $Ok -ge 0) {
+        $pct = [int][Math]::Floor((100.0 * $Ok) / $Total)
+        if ($pct -gt 100) { $pct = 100 }
+        if ($pct -lt 0) { $pct = 0 }
+    }
+    $counts = ""
+    if ($Ok -ge 0 -and $Total -gt 0) { $counts = ("({0}/{1})" -f $Ok, $Total) }
+    $progress = ""
+    if ($pct -ge 0) { $progress = ("{0}% {1}" -f $pct, $counts).Trim() }
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($script:GcrTitleRepoName) { [void]$parts.Add([string]$script:GcrTitleRepoName) }
+    switch ($State) {
+        "init"    { [void]$parts.Add("starting") }
+        "fetch"   { [void]$parts.Add("fetching metadata") }
+        "list"    { [void]$parts.Add("listing files") }
+        "scan"    { [void]$parts.Add(("scanning workspace " + $counts).Trim()) }
+        "repair"  { [void]$parts.Add("repairing index") }
+        "download" {
+            if ($progress) { [void]$parts.Add($progress) } else { [void]$parts.Add("downloading files") }
+            if ($Fail -gt 0) { [void]$parts.Add("failed " + $Fail) }
+        }
+        "paused"  {
+            if ($progress) { [void]$parts.Add($progress) }
+            [void]$parts.Add("PAUSED")
+        }
+        "done"    { [void]$parts.Add(("done " + $counts).Trim()) }
+        "error"   {
+            if ($progress) { [void]$parts.Add($progress) }
+            if ($Fail -gt 0) { [void]$parts.Add("FAILED " + $Fail) } else { [void]$parts.Add("failed") }
+        }
+        "stopped" { [void]$parts.Add("stopped") }
+        default   {
+            if ($progress) { [void]$parts.Add($progress) }
+            if ($Fail -gt 0) { [void]$parts.Add("failed " + $Fail) }
+        }
+    }
+    [void]$parts.Add("git-clone-resume")
+    Set-GcrWindowTitle -Text ($parts -join "  ·  ")
+}
+
+# Pick the string for the active language. Unlike the substring translation
+# table (meant for TUI/wizard text), this is exact - used where a wrong or
+# half-translated line would be visible, such as the result panel.
+function Get-GcrText {
+    param([string]$Zh, [string]$En)
+    if ($script:GcrLanguage -eq "en-US" -and $En) { return $En }
+    return $Zh
+}
+
 function Show-Usage {
     Write-Host "Git resume clone for Windows / PowerShell 5.1+"
     Write-Host ""
@@ -524,7 +668,7 @@ function Show-Usage {
     Write-Host "  -OutDir <dir>           Local directory (default: from URL)"
     Write-Host "  -Ref <branch/tag/sha>   Default: remote HEAD"
     Write-Host "  -BatchSize <N>          Files per batch, default 32"
-    Write-Host "  -MaxRetries <N>         Retries per failed batch/file, default 8"
+    Write-Host "  -MaxRetries <N>         Retries per file / blob fetch, default 8"
     Write-Host "  -Include a,b            Only download matching paths"
     Write-Host "  -Exclude a,b            Skip matching paths"
     Write-Host "  -Depth <N>              Optional shallow clone depth"
@@ -542,6 +686,9 @@ function Show-Usage {
     Write-Host "Interactive: run with no URL to open the TUI wizard."
     Write-Host "Resume: run the same command again. State is in .git/partial-resume/"
     Write-Host "Keys: Q stop  P pause  F failures  ? help  Ctrl+C twice to kill git"
+    Write-Host ""
+    Write-Host "Env: GCR_TITLE=1/0 force or disable the taskbar/tab title (default: on in a terminal)"
+    Write-Host "     GCR_ASCII=1   force ASCII box drawing"
 }
 
 if ($Help) {
@@ -644,7 +791,8 @@ function Invoke-GitProcess {
         [int]$TimeoutMs = 0,
         [switch]$ExpectFail,
         [switch]$InheritConsole,
-        [string]$Heartbeat
+        [string]$Heartbeat,
+        [hashtable]$EnvOverride
     )
     if (-not $script:GitExe) { $script:GitExe = Get-GitExePath }
 
@@ -653,6 +801,9 @@ function Invoke-GitProcess {
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = -not $InheritConsole
     $psi.RedirectStandardInput = $true
+    # Without this the writer for StandardInput inherits [Console]::InputEncoding
+    # (UTF8 *with* BOM) and emits a BOM prefix as soon as it is flushed.
+    try { $psi.StandardInputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
     if ($InheritConsole) {
         $psi.RedirectStandardOutput = $false
         $psi.RedirectStandardError = $false
@@ -663,6 +814,11 @@ function Invoke-GitProcess {
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     }
     if ($WorkDir) { $psi.WorkingDirectory = $WorkDir }
+    if ($EnvOverride) {
+        foreach ($k in $EnvOverride.Keys) {
+            try { $psi.EnvironmentVariables[[string]$k] = [string]$EnvOverride[$k] } catch { }
+        }
+    }
     $psi.Arguments = Convert-ToGitArgumentString -GitArgs $GitArgs
 
     $proc = New-Object System.Diagnostics.Process
@@ -827,7 +983,8 @@ function Invoke-GitRetry {
         [int]$TimeoutMs = 0,
         [switch]$InheritConsole,
         [string]$Heartbeat,
-        [int]$Retries = -1
+        [int]$Retries = -1,
+        [hashtable]$EnvOverride
     )
     $attempt = 0
     $delay = [Math]::Max(0, $RetryDelaySeconds)
@@ -838,7 +995,7 @@ function Invoke-GitRetry {
     while ($attempt -lt $limit) {
         $attempt++
         try {
-            $r = Invoke-GitProcess -GitArgs $GitArgs -WorkDir $WorkDir -TimeoutMs $TimeoutMs -ExpectFail -InheritConsole:$InheritConsole -Heartbeat $Heartbeat
+            $r = Invoke-GitProcess -GitArgs $GitArgs -WorkDir $WorkDir -TimeoutMs $TimeoutMs -ExpectFail -InheritConsole:$InheritConsole -Heartbeat $Heartbeat -EnvOverride $EnvOverride
             if ($script:GcrUserStop) { throw "已由用户停止。" }
             if ($r.ExitCode -eq 0) { return $r }
             $lastError = "exit " + $r.ExitCode
@@ -850,12 +1007,12 @@ function Invoke-GitRetry {
             $lastError = $_.Exception.Message
         }
         if ($attempt -ge $limit) { break }
-        Write-Log ($What + " 失败 (第 " + $attempt + "/" + $limit + " 次): " + $lastError + " ；" + $delay + "s 后重试") "WARN"
+        Write-Log (Get-GcrText ($What + " 失败 (第 " + $attempt + "/" + $limit + " 次): " + $lastError + " ；" + $delay + "s 后重试") ($What + " failed (attempt " + $attempt + "/" + $limit + "): " + $lastError + " ; retrying in " + $delay + "s")) "WARN"
         Start-Sleep -Seconds $delay
         $delay = [Math]::Min(60, [Math]::Max(1, $delay * 2))
         Clear-StaleIndexLock -RepoRoot $WorkDir
     }
-    throw ($What + " 在 " + $limit + " 次重试后仍失败: " + $lastError)
+    throw (Get-GcrText ($What + " 在 " + $limit + " 次重试后仍失败: " + $lastError) ($What + " still failed after " + $limit + " attempts: " + $lastError))
 }
 
 function Save-TextFile {
@@ -1105,30 +1262,245 @@ function Load-DoneSet {
     return ,$set
 }
 
-function Invoke-CheckoutBatch {
+function Get-BatchBlobOids {
+    param($Batch)
+    $list = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+    # NB: on Windows PowerShell 5.1 `@($list)` on a List[object] holding
+    # PSCustomObjects throws "parameter type mismatch", and binding such a list
+    # to [string[]] silently joins the items with spaces. Always foreach.
+    foreach ($e in $Batch) {
+        if ($null -eq $e) { continue }
+        $o = [string]$e.Blob
+        if ([string]::IsNullOrWhiteSpace($o)) { continue }
+        if ($seen.Add($o)) { [void]$list.Add($o) }
+    }
+    return ,$list
+}
+
+# Ask the promisor remote for exactly these blob oids. This mirrors git's own
+# lazy fetch (promisor-remote.c: fetch_objects) but passes the ids as arguments
+# instead of --stdin, so no stdin encoding can mangle them.
+#   git -c fetch.negotiationAlgorithm=noop fetch <remote> --no-tags
+#       --no-write-fetch-head --recurse-submodules=no --filter=blob:none <oid>...
+# Result: one request per chunk instead of git's implicit one-request-per-file,
+# proper retries, and a real error message when it fails.
+function Invoke-BlobFetch {
+    param([string]$RepoRoot, $Oids, [int]$Attempts = 3)
+
+    $oidList = New-Object System.Collections.Generic.List[string]
+    foreach ($o in $Oids) { if ($o) { [void]$oidList.Add([string]$o) } }
+    if ($oidList.Count -eq 0) { return $true }
+    $baseArgs = @(
+        "-c", "fetch.negotiationAlgorithm=noop",
+        "-c", "core.quotepath=false",
+        "fetch", "origin", "--no-tags", "--no-write-fetch-head",
+        "--recurse-submodules=no", "--filter=blob:none"
+    )
+    $limit = [Math]::Max(1, $Attempts)
+    $delay = [Math]::Max(0, $RetryDelaySeconds)
+    # Keep every command line far below the Windows limit (~32k chars).
+    $chunkSize = 128
+    $allOk = $true
+    for ($start = 0; $start -lt $oidList.Count; $start += $chunkSize) {
+        $take = [Math]::Min($chunkSize, $oidList.Count - $start)
+        $chunk = $oidList.GetRange($start, $take)
+        $gitArgs = New-Object System.Collections.Generic.List[string]
+        foreach ($x in $baseArgs) { [void]$gitArgs.Add([string]$x) }
+        foreach ($o in $chunk) { [void]$gitArgs.Add([string]$o) }
+        $chunkOk = $false
+        $last = ""
+        for ($i = 1; $i -le $limit; $i++) {
+            if ($script:GcrUserStop) { throw "已由用户停止。" }
+            $r = Invoke-GitProcess -WorkDir $RepoRoot -ExpectFail -GitArgs $gitArgs.ToArray()
+            if ($r.ExitCode -eq 0) { $chunkOk = $true; break }
+            $tail = $r.StdErr
+            if ([string]::IsNullOrWhiteSpace($tail)) { $tail = $r.StdOut }
+            $last = "exit " + $r.ExitCode + " : " + $tail.Trim()
+            if ($i -lt $limit) {
+                Write-Log (Get-GcrText ("按需拉取 " + $chunk.Count + " 个 blob 失败 (第 " + $i + "/" + $limit + " 次): " + $last + " ；" + $delay + "s 后重试") ("Blob fetch for " + $chunk.Count + " blob(s) failed (attempt " + $i + "/" + $limit + "): " + $last + " ; retrying in " + $delay + "s")) "WARN"
+                Start-Sleep -Seconds $delay
+                $delay = [Math]::Min(60, [Math]::Max(1, $delay * 2))
+                Clear-StaleIndexLock -RepoRoot $RepoRoot
+            }
+        }
+        if (-not $chunkOk) {
+            Write-Log (Get-GcrText ("按需拉取 " + $chunk.Count + " 个 blob 未成功: " + $last) ("Blob fetch for " + $chunk.Count + " blob(s) did not succeed: " + $last)) "WARN"
+            $allOk = $false
+        }
+    }
+    return $allOk
+}
+
+# Fetch the blobs these entries need: whole group first, bisected on failure so
+# one unavailable object cannot poison the others.
+function Prefetch-BatchBlobs {
+    param([string]$RepoRoot, $Entries, [int]$Attempts = 3)
+
+    $oids = Get-BatchBlobOids -Batch $Entries
+    if ($null -eq $oids -or $oids.Count -eq 0) { return }
+    $nFiles = 0
+    foreach ($e in $Entries) { if ($null -ne $e) { $nFiles++ } }
+    Write-Log (Get-GcrText ("按需拉取 " + $oids.Count + " 个 blob（对应 " + $nFiles + " 个路径）") ("Fetching " + $oids.Count + " blob(s) on demand for " + $nFiles + " path(s)")) "INFO"
+
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    $queue.Enqueue([pscustomobject]@{ Oids = $oids; Attempts = [Math]::Max(1, $Attempts) })
+    $guard = 0
+    while ($queue.Count -gt 0) {
+        $guard++
+        if ($guard -gt 512) { Write-Log (Get-GcrText "按需拉取拆分次数过多，剩下的交给 checkout 重试。" "Too many fetch splits; leaving the rest to the checkout retry.") "WARN"; break }
+        $job = $queue.Dequeue()
+        $jobOids = $job.Oids
+        if ($null -eq $jobOids -or $jobOids.Count -eq 0) { continue }
+        $ok = Invoke-BlobFetch -RepoRoot $RepoRoot -Oids $jobOids -Attempts $job.Attempts
+        if ($jobOids.Count -eq 1) {
+            if (-not $ok) { Write-Log (Get-GcrText ("远端拿不到该 blob（会在失败列表里重试）: " + [string]$jobOids[0]) ("The remote cannot provide this blob (it is retried via the failure list): " + [string]$jobOids[0])) "WARN" }
+            continue
+        }
+        if ($ok) { continue }
+        $half = [int][Math]::Floor($jobOids.Count / 2)
+        if ($half -lt 1) { $half = 1 }
+        $left = $jobOids.GetRange(0, $half)
+        $right = $jobOids.GetRange($half, $jobOids.Count - $half)
+        $next = [Math]::Max(1, $job.Attempts - 1)
+        Write-Log (Get-GcrText ("拆半重试 " + $left.Count + " + " + $right.Count + " 个 blob") ("Retrying in halves: " + $left.Count + " + " + $right.Count + " blob(s)")) "INFO"
+        $queue.Enqueue([pscustomobject]@{ Oids = $left; Attempts = $next })
+        $queue.Enqueue([pscustomobject]@{ Oids = $right; Attempts = $next })
+    }
+}
+
+# One raw `git checkout <sha> -- <paths>` call (no retry of its own).
+# GIT_NO_LAZY_FETCH turns it into a purely local operation: the caller fetches
+# the blobs it needs on purpose (Prefetch-BatchBlobs). Without that, git tries
+# to fetch each missing blob by itself - one subprocess per file - and when such
+# a fetch does not deliver the blob it only reports
+#   error: unable to read sha1 file of <path> (<oid>)
+# which is exactly the message that used to make whole batches look broken
+# (and made every file fail once, before the retry finally succeeded).
+function Invoke-CheckoutOnce {
     param(
         [string]$RepoRoot,
         [string]$Sha,
-        $Batch
+        $Batch,
+        [int]$Retries = 1
     )
     $gitArgsList = New-Object System.Collections.Generic.List[string]
     foreach ($x in @("-c", "core.quotepath=false", "-c", "core.longpaths=true", "-c", "advice.detachedHead=false", "checkout", "--progress", $Sha, "--")) {
         [void]$gitArgsList.Add([string]$x)
     }
     $n = 0
+    $firstPath = ""
     foreach ($e in $Batch) {
+        if ($null -eq $e) { continue }
+        if ($n -eq 0) { $firstPath = [string]$e.Path }
         [void]$gitArgsList.Add([string]$e.Path)
         $n++
     }
     if ($n -le 0) { return }
     Ensure-ParentDirectories -RepoRoot $RepoRoot -Batch $Batch
-    $first = [string]$Batch[0].Path
-    $hb = "downloading " + $n + " file(s), e.g. " + $first
-    # Multi-file checkout: try once. Retrying the same 64-file batch on Windows
-    # wastes minutes (sha1 missing + cannot create directory) and can desync the index.
+    $hb = "downloading " + $n + " file(s), e.g. " + $firstPath
+    # Multi-file checkout: try once. Retrying the same big batch on Windows
+    # wastes minutes (cannot create directory) and can desync the index; the
+    # caller bisects instead. Single files may use the full retry budget.
+    Invoke-GitRetry -What ("checkout " + $n + " files") -WorkDir $RepoRoot -Heartbeat $hb `
+        -Retries ([Math]::Max(1, $Retries)) `
+        -EnvOverride @{ "GIT_NO_LAZY_FETCH" = "1" } `
+        -GitArgs $gitArgsList.ToArray() | Out-Null
+}
+
+# Check out a group of files and return @{ Ok = <landed>; Bad = <still missing> }.
+# A failing git command does not mean the group failed: we always re-check what
+# actually landed and retry only what is really missing (bisected down to single
+# files), so one bad path never costs a full batch of git invocations.
+function Complete-CheckoutGroup {
+    param(
+        [string]$RepoRoot,
+        [string]$Sha,
+        $Entries,
+        [int]$Depth = 0
+    )
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($e in $Entries) { if ($null -ne $e) { [void]$items.Add($e) } }
+    if ($items.Count -eq 0) { return @{ Ok = @(); Bad = @() } }
+
+    $ok = New-Object System.Collections.Generic.List[object]
+    $bad = New-Object System.Collections.Generic.List[object]
+    $single = ($items.Count -eq 1)
+
+    # 1) local attempt. Blobs are fetched on purpose below, so a blob that is
+    #    missing fails fast here instead of triggering git's lazy fetch (which
+    #    fetches one blob per subprocess and then still reports
+    #    "error: unable to read sha1 file of <path> (<oid>)").
+    try {
+        Invoke-CheckoutOnce -RepoRoot $RepoRoot -Sha $Sha -Batch $items -Retries 1
+    } catch {
+        if ($script:GcrUserStop) { throw }
+        $msg = [string]$_.Exception.Message
+        if ($single) {
+            Write-Log (Get-GcrText ("单文件 checkout 失败: " + $msg) ("Single-file checkout failed: " + $msg)) "WARN"
+        } else {
+            # Keep one line: a cold batch reports one "unable to read sha1 file of"
+            # per missing file, which is expected and noisy.
+            $head = $msg
+            $extra = ""
+            $lines = @($msg -split "[\r\n]+" | Where-Object { $_.Trim() })
+            if ($lines.Count -gt 0) { $head = [string]$lines[0] }
+            if ($lines.Count -gt 1) {
+                $extra = Get-GcrText (" （另有 " + ($lines.Count - 1) + " 行同类输出）") (" (plus " + ($lines.Count - 1) + " similar lines)")
+            }
+            # NB: keep the call in its own variable - "Get-GcrText (..) (..) + $head"
+            # would let PowerShell treat "+ $head" as a separate argument.
+            $prefix = Get-GcrText ("这一组 (" + $items.Count + " 个路径) 未全部成功；本地缺 blob 时属正常，下面只补缺的: ") ("This group (" + $items.Count + " path(s)) did not fully complete; normal when blobs are missing locally, fetching only what is missing: ")
+            Write-Log ($prefix + $head + $extra) "INFO"
+        }
+    }
+
+    # 2) trust the worktree, not the exit code
+    $res = Confirm-BatchFiles -RepoRoot $RepoRoot -Batch $items
+    foreach ($x in $res.Ok) { [void]$ok.Add($x) }
+    $missing = New-Object System.Collections.Generic.List[object]
+    foreach ($x in $res.Bad) { [void]$missing.Add($x) }
+    if ($missing.Count -eq 0) { return @{ Ok = $ok; Bad = $bad } }
+
+    # 3) network: ask for exactly the blobs those files need (batched + retried)
+    $attempts = 3
+    if ($single) { $attempts = $MaxRetries }
+    Prefetch-BatchBlobs -RepoRoot $RepoRoot -Entries $missing -Attempts $attempts
+
+    # 4) retry only what did not land (single files may use the full budget)
     $tries = 1
-    if ($n -eq 1) { $tries = $MaxRetries }
-    Invoke-GitRetry -What ("checkout " + $n + " files") -WorkDir $RepoRoot -Heartbeat $hb -Retries $tries -GitArgs $gitArgsList.ToArray() | Out-Null
+    if ($single) { $tries = $MaxRetries }
+    try {
+        Invoke-CheckoutOnce -RepoRoot $RepoRoot -Sha $Sha -Batch $missing -Retries $tries
+    } catch {
+        if ($script:GcrUserStop) { throw }
+        Write-Log (Get-GcrText ("重试 checkout 仍有失败: " + $_.Exception.Message) ("Checkout retry still failed: " + $_.Exception.Message)) "WARN"
+    }
+
+    $still = New-Object System.Collections.Generic.List[object]
+    foreach ($x in $missing) {
+        if (Test-FileComplete -RepoRoot $RepoRoot -Entry $x) { [void]$ok.Add($x) } else { [void]$still.Add($x) }
+    }
+    if ($still.Count -eq 0) { return @{ Ok = $ok; Bad = $bad } }
+    if ($single -or $still.Count -eq 1 -or $Depth -ge 8) {
+        # nothing left to isolate: report the survivors
+        foreach ($x in $still) { [void]$bad.Add($x) }
+        return @{ Ok = $ok; Bad = $bad }
+    }
+
+    # 5) still incomplete: halve to isolate the problematic path(s)
+    $half = [int][Math]::Floor($still.Count / 2)
+    if ($half -lt 1) { $half = 1 }
+    $parts = New-Object System.Collections.Generic.List[object]
+    [void]$parts.Add($still.GetRange(0, $half))
+    if ($half -lt $still.Count) { [void]$parts.Add($still.GetRange($half, $still.Count - $half)) }
+    foreach ($part in $parts) {
+        if ($part.Count -eq 0) { continue }
+        $sub = Complete-CheckoutGroup -RepoRoot $RepoRoot -Sha $Sha -Entries $part -Depth ($Depth + 1)
+        foreach ($x in $sub.Ok) { [void]$ok.Add($x) }
+        foreach ($x in $sub.Bad) { [void]$bad.Add($x) }
+    }
+    return @{ Ok = $ok; Bad = $bad }
 }
 
 function Ensure-ParentDirectories {
@@ -1170,7 +1542,7 @@ function Confirm-BatchFiles {
 }
 
 function Repair-GitIndex {
-    param([string]$RepoRoot, [string]$Sha)
+    param([string]$RepoRoot, [string]$Sha, $Entries)
     # Failed multi-path checkout on Windows can drop index entries while leaving
     # the files on disk (status: D + ??). Re-add existing files; re-checkout missing ones.
     $porcelain = Invoke-GitProcess -WorkDir $RepoRoot -ExpectFail -GitArgs @(
@@ -1193,17 +1565,31 @@ function Repair-GitIndex {
     }
     if ($add.Count -gt 0) {
         Write-Log ("repair index: git add " + $add.Count + " files that exist on disk") "WARN"
-        $args = New-Object System.Collections.Generic.List[string]
-        foreach ($x in @("-c", "core.quotepath=false", "add", "-f", "--")) { [void]$args.Add($x) }
-        foreach ($p in $add) { [void]$args.Add($p) }
-        Invoke-GitProcess -WorkDir $RepoRoot -ExpectFail -GitArgs $args.ToArray() | Out-Null
+        $gitArgs = New-Object System.Collections.Generic.List[string]
+        foreach ($x in @("-c", "core.quotepath=false", "add", "-f", "--")) { [void]$gitArgs.Add($x) }
+        foreach ($p in $add) { [void]$gitArgs.Add($p) }
+        Invoke-GitProcess -WorkDir $RepoRoot -ExpectFail -GitArgs $gitArgs.ToArray() | Out-Null
     }
     if ($needCheckout.Count -gt 0) {
+        # Same rule as the download loop: make sure the blobs are local before
+        # asking git to check the paths out (no slow one-by-one lazy fetch).
+        if ($Entries) {
+            $want = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+            foreach ($p in $needCheckout) { [void]$want.Add([string]$p) }
+            $fake = New-Object System.Collections.Generic.List[object]
+            foreach ($e in $Entries) {
+                if ($null -eq $e) { continue }
+                if ($want.Contains([string]$e.Path)) {
+                    [void]$fake.Add([pscustomobject]@{ Path = [string]$e.Path; Blob = [string]$e.Blob })
+                }
+            }
+            if ($fake.Count -gt 0) { Prefetch-BatchBlobs -RepoRoot $RepoRoot -Entries $fake.ToArray() -Attempts 2 }
+        }
         Write-Log ("repair index: re-checkout " + $needCheckout.Count + " missing files") "WARN"
-        $args = New-Object System.Collections.Generic.List[string]
-        foreach ($x in @("-c", "core.quotepath=false", "checkout", $Sha, "--")) { [void]$args.Add($x) }
-        foreach ($p in $needCheckout) { [void]$args.Add($p) }
-        Invoke-GitProcess -WorkDir $RepoRoot -ExpectFail -GitArgs $args.ToArray() | Out-Null
+        $gitArgs = New-Object System.Collections.Generic.List[string]
+        foreach ($x in @("-c", "core.quotepath=false", "checkout", $Sha, "--")) { [void]$gitArgs.Add($x) }
+        foreach ($p in $needCheckout) { [void]$gitArgs.Add($p) }
+        Invoke-GitProcess -WorkDir $RepoRoot -ExpectFail -GitArgs $gitArgs.ToArray() | Out-Null
     }
 }
 
@@ -1265,6 +1651,7 @@ function Write-DownloadProgress {
     $out = $line
     if ($out.Length -lt $width) { $out = $out.PadRight($width) }
     elseif ($out.Length -gt $width) { $out = $out.Substring(0, $width) }
+    Update-GcrWindowTitle -Ok $OkCount -Total $TotalCount -Fail $FailCount
     if (Test-GcrTuiActive) {
         Update-GcrTuiProgress -OkCount $OkCount -TotalCount $TotalCount -FailCount $FailCount -DoneBytes $DoneBytes -Rate $rate -Eta $eta -CurrentFile $CurrentFile
         Invoke-GcrTuiTick
@@ -1398,6 +1785,9 @@ try {
     if (-not $OutDir) { $OutDir = Get-RepoFolderName -Url $RepoUrl }
     $repoRoot = Convert-ToFullPath -Path $OutDir
     $script:RepoRoot = $repoRoot
+    # Give the taskbar a readable name right away (repo folder, not the URL).
+    try { $script:GcrTitleRepoName = [string](Split-Path -Leaf $repoRoot) } catch { $script:GcrTitleRepoName = "" }
+    Update-GcrWindowTitle -State "init"
 
     if (Test-GcrTuiActive) {
         $resumeHint = Test-Path -LiteralPath (Join-Path $repoRoot ".git\$($script:StateDirName)\meta.txt")
@@ -1545,10 +1935,10 @@ try {
         }
         $script:GcrExitCode = 0
         $skipDownload = $true
-        $resultTitle = "DryRun 完成"
-        [void]$resultBody.Add(("清单文件: " + $listPath))
-        [void]$resultBody.Add(("文件数: " + $filtered.Count))
-        [void]$resultBody.Add("未下载 blob。去掉 -DryRun 后开始/继续克隆。")
+        $resultTitle = Get-GcrText "DryRun 完成" "DryRun complete"
+        [void]$resultBody.Add((Get-GcrText "清单文件: " "List file: ") + $listPath)
+        [void]$resultBody.Add((Get-GcrText "文件数: " "Files: ") + $filtered.Count)
+        [void]$resultBody.Add((Get-GcrText "未下载 blob。去掉 -DryRun 后开始/继续克隆。" "No blobs were downloaded. Remove -DryRun to start or resume."))
     }
 
     if (-not $skipDownload) {
@@ -1586,7 +1976,7 @@ try {
         }
         Write-GcrNewline
 
-        Write-Log ("进度: 已记录 " + $skippedDone + " ，工作区已存在 " + $skippedExist + " ，剩余 " + $pending.Count) "INFO"
+        Write-Log (Get-GcrText ("进度: 已记录 " + $skippedDone + " ，工作区已存在 " + $skippedExist + " ，剩余 " + $pending.Count) ("Progress: recorded " + $skippedDone + ", already on disk " + $skippedExist + ", remaining " + $pending.Count)) "INFO"
 
         $okCount = $skippedDone + $skippedExist
         $totalCount = $filtered.Count
@@ -1599,9 +1989,10 @@ try {
             Write-Log "工作区: $repoRoot" "OK"
             $script:GcrExitCode = 0
             $skipDownload = $true
-            $resultTitle = "全部文件已就绪"
-            [void]$resultBody.Add(("工作区: " + $repoRoot))
-            [void]$resultBody.Add(("文件: {0}/{1}" -f $okCount, $totalCount))
+            $resultTitle = Get-GcrText "全部文件已就绪" "All files are ready"
+            [void]$resultBody.Add((Get-GcrText "工作区: " "Workspace: ") + $repoRoot)
+            [void]$resultBody.Add((Get-GcrText "文件: " "Files: ") + ("{0}/{1}" -f $okCount, $totalCount))
+            Update-GcrWindowTitle -State "done" -Ok $okCount -Total $totalCount
         }
     }
 
@@ -1626,46 +2017,21 @@ try {
             $preview = $batch[0].Path
             Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount $failCount -DoneBytes $doneBytes -Elapsed ((Get-Date) - $started) -DoneThisRun $processedThisRun -CurrentFile $preview
 
-            try {
-                Invoke-CheckoutBatch -RepoRoot $repoRoot -Sha $pinnedSha -Batch $batch
-                $result = Confirm-BatchFiles -RepoRoot $repoRoot -Batch $batch
-                foreach ($x in $result.Ok) { [void]$okThis.Add($x) }
-                foreach ($x in $result.Bad) { [void]$badThis.Add($x) }
-            } catch {
-                if ($script:GcrUserStop) { throw }
-                $nBatch = @($batch).Count
-                if ($nBatch -gt 1) {
-                    Write-Log ("批次 " + $batchIndex + "/" + $batches.Count + " 失败（" + $nBatch + " 个文件），立即拆成单文件，不再整批重试: " + $_.Exception.Message) "WARN"
-                } else {
-                    Write-Log ("单文件失败: " + $_.Exception.Message) "WARN"
-                }
-                foreach ($x in $batch) { [void]$badThis.Add($x) }
-            }
+            # 先把这批缺的 blob 批量拉全（网络），再本地 checkout；
+            # 失败时核对落盘结果并二分重试，不会因一个文件就废弃整批。
+            $result = Complete-CheckoutGroup -RepoRoot $repoRoot -Sha $pinnedSha -Entries $batch
+            foreach ($x in $result.Ok) { [void]$okThis.Add($x) }
+            foreach ($x in $result.Bad) { [void]$badThis.Add($x) }
 
-            $retry = New-Object System.Collections.Generic.List[object]
-            foreach ($e in $badThis) { [void]$retry.Add($e) }
-            foreach ($e in $retry) {
+            foreach ($e in $badThis) {
                 Assert-GcrContinue
-                $oneOk = $false
-                $one = New-Object System.Collections.Generic.List[object]
-                [void]$one.Add($e)
-                try {
-                    Invoke-CheckoutBatch -RepoRoot $repoRoot -Sha $pinnedSha -Batch $one
-                    if (Test-FileComplete -RepoRoot $repoRoot -Entry $e) { $oneOk = $true }
-                } catch {
-                    if ($script:GcrUserStop) { throw }
-                    Add-FailedPath -FailedPath $failedPath -RelPath $e.Path -Reason $_.Exception.Message
-                }
-                if ($oneOk) {
-                    [void]$okThis.Add($e)
-                } else {
-                    $failCount++
-                    Add-GcrTuiFailure -Path $e.Path
-                    $fullFail = Get-WorktreePath -Root $repoRoot -Rel $e.Path
-                    $why = "no worktree file"
-                    if (Test-Path -LiteralPath $fullFail) { $why = "worktree file present but still incomplete" }
-                    Write-Log ("仍失败: " + $e.Path + " (" + $why + ")") "ERROR"
-                }
+                $failCount++
+                Add-GcrTuiFailure -Path $e.Path
+                $fullFail = Get-WorktreePath -Root $repoRoot -Rel $e.Path
+                $why = Get-GcrText "blob 拿不到或 checkout 失败（工作区无此文件）" "blob unavailable or checkout failed (no file in the worktree)"
+                if (Test-Path -LiteralPath $fullFail) { $why = "worktree file present but still incomplete" }
+                Add-FailedPath -FailedPath $failedPath -RelPath $e.Path -Reason $why
+                Write-Log ("仍失败: " + $e.Path + " (" + $why + ")") "ERROR"
             }
 
             $okPaths = New-Object System.Collections.Generic.List[string]
@@ -1694,23 +2060,27 @@ try {
             Write-Progress -Activity "git-clone-resume" -Completed
         }
         Set-GcrTuiPhase -Name "repair" -Detail "git index"
-        Repair-GitIndex -RepoRoot $repoRoot -Sha $pinnedSha
+        Repair-GitIndex -RepoRoot $repoRoot -Sha $pinnedSha -Entries $filtered
         $elapsed = (Get-Date) - $started
         $elapsedText = "{0:00}:{1:00}:{2:00}" -f [int]$elapsed.TotalHours, $elapsed.Minutes, $elapsed.Seconds
-        Write-Log ("完成: 成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText) "OK"
-        Write-Log "工作区: $repoRoot" "OK"
-        [void]$resultBody.Add(("工作区: " + $repoRoot))
-        [void]$resultBody.Add(("成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText))
+        Write-Log (Get-GcrText ("完成: 成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText) ("Complete: succeeded {0}/{1}, failed {2}, elapsed {3}" -f $okCount, $totalCount, $failCount, $elapsedText)) "OK"
+        Write-Log (Get-GcrText ("工作区: " + $repoRoot) ("Workspace: " + $repoRoot)) "OK"
+        [void]$resultBody.Add((Get-GcrText "工作区: " "Workspace: ") + $repoRoot)
+        [void]$resultBody.Add((Get-GcrText (
+                    "成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText) (
+                    "Succeeded {0}/{1}   failed {2}   elapsed {3}" -f $okCount, $totalCount, $failCount, $elapsedText)))
         if ($failCount -gt 0) {
-            Write-Log "失败列表: $failedPath  （再次运行本脚本会重试未完成文件）" "WARN"
-            [void]$resultBody.Add(("失败列表: " + $failedPath))
-            [void]$resultBody.Add("再次运行同一命令会重试未完成文件。")
+            Write-Log (Get-GcrText ("失败列表: " + $failedPath + "  （再次运行本脚本会重试未完成文件）") ("Failure list: " + $failedPath + "  (rerun this script to retry the unfinished files)")) "WARN"
+            [void]$resultBody.Add((Get-GcrText "失败列表: " "Failure list: ") + $failedPath)
+            [void]$resultBody.Add((Get-GcrText "再次运行同一命令会重试未完成文件。" "Run the same command again to retry the unfinished files."))
             $script:GcrExitCode = 1
             $resultKind = "error"
-            $resultTitle = "部分文件失败"
+            $resultTitle = Get-GcrText "部分文件失败" "Some files failed"
+            Update-GcrWindowTitle -State "error" -Ok $okCount -Total $totalCount -Fail $failCount
         } else {
             $script:GcrExitCode = 0
-            $resultTitle = "克隆完成"
+            $resultTitle = Get-GcrText "克隆完成" "Clone complete"
+            Update-GcrWindowTitle -State "done" -Ok $okCount -Total $totalCount
         }
     }
 
@@ -1721,7 +2091,7 @@ try {
         Save-GcrHistory -Url $RepoUrl -OutDir $repoRoot -Ref $Ref -Commit $pinnedSha -Status $histStatus -Ok $okCount -Total $totalCount -Fail $failCount
     }
     if (Test-GcrTuiActive) {
-        if (-not $resultTitle) { $resultTitle = "完成" }
+        if (-not $resultTitle) { $resultTitle = Get-GcrText "完成" "Complete" }
         Show-GcrTuiResult -Title $resultTitle -Body $resultBody.ToArray() -Kind $resultKind
     }
 }
@@ -1731,8 +2101,9 @@ catch {
     if (-not $err) { try { $err = [string]$_ } catch { $err = "unknown error" } }
     Write-Log $err "ERROR"
     if ($_.ScriptStackTrace -and -not $script:GcrUserStop) { Write-Log ([string]$_.ScriptStackTrace) "ERROR" }
+    Update-GcrWindowTitle -State $(if ($script:GcrUserStop) { "stopped" } else { "error" })
     if ($script:RepoRoot) {
-        Write-Log ("中断后续传: 重新执行同一命令即可。仓库目录: " + $script:RepoRoot) "WARN"
+        Write-Log (Get-GcrText ("中断后续传: 重新执行同一命令即可。仓库目录: " + $script:RepoRoot) ("Resume after interruption: run the same command again. Repository directory: " + $script:RepoRoot)) "WARN"
     }
     if (Get-Command Save-GcrHistory -ErrorAction SilentlyContinue -and $script:RepoRoot) {
         $st = "failed"
@@ -1741,15 +2112,16 @@ catch {
     }
     if (Test-GcrTuiActive) {
         $body = @($err)
-        if ($script:RepoRoot) { $body += ("仓库目录: " + $script:RepoRoot) }
-        $body += "再次运行同一命令即可续传。"
-        $title = $(if ($script:GcrUserStop) { "已停止" } else { "出错" })
+        if ($script:RepoRoot) { $body += ((Get-GcrText "仓库目录: " "Repository directory: ") + $script:RepoRoot) }
+        $body += (Get-GcrText "再次运行同一命令即可续传。" "Run the same command again to resume.")
+        $title = $(if ($script:GcrUserStop) { Get-GcrText "已停止" "Stopped" } else { Get-GcrText "出错" "Error" })
         Show-GcrTuiResult -Title $title -Body $body -Kind "error"
     }
     $script:GcrExitCode = 1
 }
 finally {
     if (Get-Command Close-GcrTui -ErrorAction SilentlyContinue) { Close-GcrTui }
+    Restore-GcrWindowTitle
 }
 
 exit $script:GcrExitCode
