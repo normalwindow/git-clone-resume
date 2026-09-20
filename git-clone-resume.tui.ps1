@@ -328,6 +328,7 @@ function Initialize-GcrTuiState {
         Fail          = 0
         Bytes         = [int64]0
         Rate          = 0.0
+        Speed         = 0.0
         Eta           = "--:--:--"
         CurrentFile   = ""
         GitPercent    = -1
@@ -546,7 +547,8 @@ function Update-GcrTuiProgress {
         [int64]$DoneBytes,
         [double]$Rate,
         [string]$Eta,
-        [string]$CurrentFile
+        [string]$CurrentFile,
+        [double]$SpeedBps = -1
     )
     if (-not (Test-GcrTuiActive)) { return }
     $script:GcrTui.Ok = $OkCount
@@ -554,6 +556,7 @@ function Update-GcrTuiProgress {
     $script:GcrTui.Fail = $FailCount
     $script:GcrTui.Bytes = $DoneBytes
     $script:GcrTui.Rate = $Rate
+    if ($SpeedBps -ge 0) { $script:GcrTui.Speed = $SpeedBps }
     if ($Eta) { $script:GcrTui.Eta = $Eta }
     if ($PSBoundParameters.ContainsKey("CurrentFile")) { $script:GcrTui.CurrentFile = $CurrentFile }
     $script:GcrTui.Dirty = $true
@@ -1130,11 +1133,17 @@ function Render-GcrTui {
 
     $bytes = ""
     try { $bytes = Format-Bytes ([int64]$script:GcrTui.Bytes) } catch { $bytes = [string]$script:GcrTui.Bytes }
-    $stats = (" {0}/{1}  失败 {2}  {3}  {4:N1}/s  ETA {5}" -f @(
+    $speed = "--"
+    try {
+        if ([double]$script:GcrTui.Speed -ge 1) { $speed = (Format-Bytes ([int64]$script:GcrTui.Speed)) + "/s" }
+    } catch { $speed = "--" }
+    # 100.0%  12.3 MB  1.25 MB/s  4.2 files/s  ETA 00:01:20
+    $stats = (" {0}/{1}  失败 {2}  {3}  {4}  {5:N1} files/s  ETA {6}" -f @(
             $script:GcrTui.Ok,
             $script:GcrTui.Total,
             $script:GcrTui.Fail,
             $bytes,
+            $speed,
             $script:GcrTui.Rate,
             $script:GcrTui.Eta
         ))
@@ -2004,4 +2013,5 @@ function Show-GcrInteractiveSetup {
 function Write-GcrNewline {
     if (Test-GcrTuiActive) { return }
     Write-Host ""
+    $script:GcrProgressOpen = $false
 }

@@ -57,7 +57,7 @@ On the first wizard screen, select `Language` and choose Chinese or English. Pre
 
 Progress is stored outside the worktree in `.git/partial-resume/`. Do not delete the target repository's `.git` directory. Completed files are skipped on subsequent runs; failed files are retried.
 
-File contents (blobs) are fetched on purpose, in one batched request per group, instead of letting `git checkout` trigger git's implicit lazy fetch (which fetches one blob per subprocess and then still reports `error: unable to read sha1 file of <path> (<oid>)` with exit 255 for that same process). A failing git command never means the whole group failed: only the files that did not land are fetched and retried, bisected when needed.
+File contents (blobs) are fetched on purpose, in one batched request per group, instead of letting `git checkout` trigger git's implicit lazy fetch (which fetches one blob per subprocess). Each batch probes first (`git cat-file --batch-check` with `GIT_NO_LAZY_FETCH=1`, fully offline) so only the blobs that are really missing are requested, then `git checkout` is a local file write. A failing git command never means the whole group failed: only the files that did not land are fetched and retried, bisected when needed.
 
 The tool skips submodule gitlinks. Run it separately for submodules. After checking out Git LFS files, run `git lfs pull` if actual LFS content is needed.
 
@@ -73,6 +73,19 @@ nature-skills  ·  done (802/802)  ·  git-clone-resume
 ```
 
 Phases show as `fetching metadata` / `listing files` / `scanning workspace` / `repairing index`. The previous title is restored on exit. Control it with `GCR_TITLE=1` (force, also when output is redirected) or `GCR_TITLE=0` (disable).
+
+## Progress and download speed
+
+The progress line (`-NoTui`) and the TUI panel both show a download speed:
+
+```
+[######################------]  80.0%  32/40  fail 0  480.5 KB  717.4 KB/s  37.5 files/s  ETA 00:01:20  dir03/file11.txt
+```
+
+- The speed is the bytes this batch actually put on disk divided by the time it needed, summed over a 20-second sliding window. It uses the same basis as the total next to it (worktree file bytes, not the compressed pack size git reports as `Receiving objects: ... 1.88 KiB`).
+- When nothing in the window is newer than 20 seconds the last value is kept, so a slow or stalled batch does not flip the reading to 0.
+- The TUI uses the same number and additionally shows git's own `Receiving objects: ... MiB/s` line for the running command.
+- `checkpoint` log lines and the final summary add an average speed.
 
 ## Result panel colors
 

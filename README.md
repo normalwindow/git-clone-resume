@@ -73,7 +73,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\git-clone-resume.ps1 https://github.com/user/repo.git
 ```
 
-在 Windows Terminal / 现代控制台里，带 URL 启动同样进入进度面板：百分比、ETA、活动日志、失败列表。脚本/CI 或输出被重定向时自动退回原来的纯日志模式。
+在 Windows Terminal / 现代控制台里，带 URL 启动同样进入进度面板：百分比、下载速度、ETA、活动日志、失败列表。脚本/CI 或输出被重定向时自动退回原来的纯日志模式。
 
 常用参数：
 
@@ -128,6 +128,19 @@ nature-skills  ·  done (802/802)  ·  git-clone-resume
 
 克隆结束后结果面板按语义着色，不再是一整块暗色：标题加粗（完成绿 / 失败红），`成功 802/802，失败 0，耗时 …` 为绿色加粗，`失败列表: …` 为黄色，工作区路径为青色，提示行为暗色。
 
+### 进度与下载速度
+
+进度行（`-NoTui`）与 TUI 面板都会显示下载速度：
+
+```
+[######################------]  80.0%  32/40  fail 0  480.5 KB  717.4 KB/s  37.5 files/s  ETA 00:01:20  dir03/file11.txt
+```
+
+- 速度 = 这一批真正落盘的字节 / 该批耗时，在 20 秒滑动窗口内统计，和左边的总量同一个口径（都是工作区文件字节，不是压缩后的传输包大小）；
+- 窗口内没有新数据时保留最后一次数值，不会在慢批或卡住时跳成 0；
+- TUI 里取同样口径；阶段行还会同时显示 git 自己上报的 `Receiving objects: … MiB/s`；
+- 结束时汇总一行平均速度，同时出现在日志、结果面板和 `checkpoint` 行里。
+
 ### TUI 快捷键
 
 克隆过程中（底栏会随阶段切换提示）：
@@ -155,9 +168,11 @@ nature-skills  ·  done (802/802)  ·  git-clone-resume
 2. `git fetch --filter=blob:none origin <ref>` 只拉 commit / tree
 3. 把 HEAD 钉在该 commit SHA 上，避免中途远端更新导致续传错位
 4. `git ls-tree -r` 得到文件清单（**不用 -l**，否则 blob:none 会为了拿 size 把全部 blob 拉下来；也不用 `-z`，PowerShell 5.1 会把 NUL 截断）
-5. 分批处理：先 `git checkout <sha> -- file1 file2 ...`（带 `GIT_NO_LAZY_FETCH=1`，只做本地操作），核对哪些没落盘，再用 `git fetch origin <blob-oid>...` 把缺的 blob 一次性拉下来并重试这些文件（必要时二分定位）
+5. 分批处理：先用 `git cat-file --batch-check`（带 `GIT_NO_LAZY_FETCH=1`，完全离线）探出这批里哪些 blob 本地还没有，再用 `git fetch origin <blob-oid>...` 把缺的一次性拉下来；然后 `git checkout <sha> -- file1 file2 ...`（`GIT_NO_LAZY_FETCH=1`，纯本地写文件），核对哪些没落盘，只重试这些文件（必要时二分定位）
 6. 成功的路径追加写入 `.git/partial-resume/done.txt`
 7. 再次运行：跳过已落盘文件。命令失败不等于整批失败，只重试真正缺的（必要时二分定位）；结束时修复 Windows 上被弄乱的 git index
+
+> 为什么先把 blob 拉全再 checkout：在 `blob:none` 的 partial clone 上，本地还没有 blob 时，`git checkout` 每个文件都会报一次 `error: unable to read sha1 file of <path> (<oid>)` 并以 255 退出（重跑一次才会成功）。反过来先 checkout 再补拉，等于每一批都注定先失败一遍，日志里会刷满“这一组 (N 个路径) 未全部成功 …”之类的告警。先拉后写就没有这种情况：checkout 失败只代表真出了问题，日志里也只保留这一行。顺带一提，也不用让 git 自己在 checkout 里按需拉 blob：那会为每个 blob 单独起一次 fetch 子进程。
 
 > 为什么不让 git 自己在 checkout 里按需拉 blob：在 `blob:none` 的 partial clone 上，git 会为每个缺失 blob 单独起一次 fetch 子进程，而且哪怕对象已经拿到，同一个进程仍会报 `error: unable to read sha1 file of <path> (<oid>)` 并以 255 退出；重跑一次才会成功。因此本脚本自己按批拉取 blob，再让 checkout 变成纯本地操作。
 
@@ -186,7 +201,7 @@ nature-skills  ·  done (802/802)  ·  git-clone-resume
 ## 注意事项
 
 - **不要**删掉目标目录里的 `.git`，否则进度和已下 blob 都没了。
-- 日志里看到 `error: unable to read sha1 file of <path> (<oid>)` 不必慌：这说明该 blob 本地缺失，脚本会先把缺的批量拉下来再重试这些文件。只有该对象在远端也已不存在（force push、仓库被裁剪等）时，对应文件才会进 `failed.txt`。
+- 日志里出现 `error: unable to read sha1 file of <path> (<oid>)` 说明该 blob 本地缺失：先拉后写的流程下正常情况下不会看到它，只有对应对象在远端也已不存在（force push、仓库被裁剪等）时才会出现，这类文件会进 `failed.txt`。
 - 私有仓库走本机已有的凭据即可（Git Credential Manager / `gh auth` / SSH key）。
 - 子模块不会自动递归；要对子模块再执行一次本脚本。
 - Git LFS 文件 checkout 后如需真正指针内容，请再执行 `git lfs pull`。

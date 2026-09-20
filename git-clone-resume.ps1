@@ -149,10 +149,18 @@ $script:GcrExitCode = 0
 $script:GcrUserStop = $false
 $script:GcrLanguage = $Language
 $script:GcrVersion = $null
+# Download-speed meter (see the "Download speed" section below).
+$script:GcrSpeedWindowSec = 20.0
+$script:GcrSpeedSamples = $null
+$script:GcrSpeedValue = 0.0
+# Object ids that are known to be in the local object database (blob probe cache).
+$script:GcrLocalBlobs = $null
+# True while a progress line sits on the current console line without a newline.
+$script:GcrProgressOpen = $false
 
 function Get-GcrVersion {
     if ($script:GcrVersion) { return [string]$script:GcrVersion }
-    $fallback = "0.1.5"
+    $fallback = "0.1.6"
     try {
         $root = $PSScriptRoot
         if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -482,7 +490,7 @@ if (Test-Path -LiteralPath $script:GcrTuiFile) {
     function Test-GcrTuiQuit { return $false }
     function Test-GcrTuiForceQuit { return $false }
     function Invoke-GcrTuiTick { }
-    function Write-GcrNewline { Write-Host "" }
+    function Write-GcrNewline { Write-Host ""; $script:GcrProgressOpen = $false }
     function Initialize-GcrTui { return $false }
     function Close-GcrTui { }
     function Set-GcrTuiPhase {
@@ -538,6 +546,12 @@ function Write-Log {
             Add-GcrTuiLog -Level $Level -Message $text
             Invoke-GcrTuiTick
         } else {
+            # A log line must not be glued to the tail of the progress line that
+            # Write-DownloadProgress left on the current console line.
+            if ($script:GcrProgressOpen) {
+                Write-Host ""
+                $script:GcrProgressOpen = $false
+            }
             Write-Host $line -ForegroundColor $color
         }
     } catch { }
@@ -792,7 +806,8 @@ function Invoke-GitProcess {
         [switch]$ExpectFail,
         [switch]$InheritConsole,
         [string]$Heartbeat,
-        [hashtable]$EnvOverride
+        [hashtable]$EnvOverride,
+        [string]$StdIn
     )
     if (-not $script:GitExe) { $script:GitExe = Get-GitExePath }
 
@@ -828,6 +843,14 @@ function Invoke-GitProcess {
     $script:GcrCurrentProc = $proc
     try {
         [void]$proc.Start()
+        if (-not [string]::IsNullOrEmpty($StdIn)) {
+            # Feed the child's stdin ourselves (e.g. cat-file --batch-check reads
+            # the object ids from it). LF only: git splits that input on \n and
+            # does NOT strip a CR, so a CRLF would end up inside the object id.
+            # $psi.StandardInputEncoding (UTF8 without BOM) is what keeps the
+            # writer from prefixing the stream with a BOM.
+            try { $proc.StandardInput.Write($StdIn) } catch { }
+        }
         $proc.StandardInput.Close()
         $waitSlice = 16
         if (-not (Test-GcrTuiActive)) { $waitSlice = 500 }
@@ -1235,6 +1258,92 @@ function Format-Bytes {
     return ("{0:N2} GB" -f ($n / 1GB))
 }
 
+# ---------------------------------------------------------------------------
+# Download speed
+# ---------------------------------------------------------------------------
+# The meter sums the bytes that landed on disk over a short sliding window and
+# divides them by the seconds those bytes needed. Deliberately measured in
+# worktree bytes, not in the transfer size git reports ("Receiving objects: ...
+# 1.88 KiB | 961.00 KiB/s"): that number is the *compressed* pack, which for
+# text-heavy repositories is orders of magnitude smaller than the content, and
+# it would contradict the "12.3 MB" total shown next to it. Same basis, same
+# numbers.
+#
+# When everything in the window is older than GcrSpeedWindowSec the last value
+# is kept: a slow or stalled batch keeps showing the rate it was measured at
+# instead of flipping to 0.
+function Reset-GcrSpeedMeter {
+    $script:GcrSpeedSamples = $null
+    $script:GcrSpeedValue = 0.0
+}
+
+function Add-GcrSpeedBytes {
+    param([int64]$Bytes, [double]$Span = 0.0)
+    if ($Bytes -le 0) { return }
+    if ($Span -lt 0.2) { $Span = 0.2 }
+    if ($Span -gt 900) { $Span = 900 }
+    if ($null -eq $script:GcrSpeedSamples) {
+        $script:GcrSpeedSamples = New-Object System.Collections.Generic.List[object]
+    }
+    $now = Get-Date
+    [void]$script:GcrSpeedSamples.Add([pscustomobject]@{ T = $now; B = [int64]$Bytes; S = [double]$Span })
+    $cut = $now.AddSeconds(-1 * $script:GcrSpeedWindowSec)
+    while ($script:GcrSpeedSamples.Count -gt 0 -and $script:GcrSpeedSamples[0].T -lt $cut) {
+        $script:GcrSpeedSamples.RemoveAt(0)
+    }
+    $sumB = [int64]0
+    $sumS = 0.0
+    foreach ($s in $script:GcrSpeedSamples) {
+        $sumB += [int64]$s.B
+        $sumS += [double]$s.S
+    }
+    if ($sumB -gt 0 -and $sumS -gt 0.1) { $script:GcrSpeedValue = $sumB / $sumS }
+}
+
+function Get-GcrSpeedValue {
+    if ($script:GcrSpeedValue -lt 0) { return 0.0 }
+    return [double]$script:GcrSpeedValue
+}
+
+function Format-GcrSpeed {
+    param([double]$BytesPerSecond)
+    if ($BytesPerSecond -lt 1) { return "--" }
+    return ((Format-Bytes -n ([int64]$BytesPerSecond)) + "/s")
+}
+
+# git writes progress with \r, so captured stderr is one long string of
+# "Receiving objects:  12% (1/8)\rReceiving objects:  25% (2/8)\r...". Real
+# messages are the lines that do not look like progress. Used for log and error
+# text so a failing command does not dump a screen of percentages.
+function Get-GcrGitTextLines {
+    param([string]$Text)
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Text)) { return ,$lines }
+    foreach ($raw in ($Text -split "[\r\n]+")) {
+        $t = $raw.Trim()
+        if (-not $t) { continue }
+        if ($t -match "^(Receiving objects|Receiving deltas|Resolving deltas|Counting objects|Compressing objects|Enumerating objects|Enumerating deltas|Updating files|Checking out files|remote: (Enumerating|Counting|Compressing))") { continue }
+        if ($t -match "^\d+% \(") { continue }
+        [void]$lines.Add($t)
+    }
+    return ,$lines
+}
+
+# First meaningful line of a (possibly multi-line, progress-laden) message,
+# plus how many more lines follow it.
+function Get-GcrErrorHead {
+    param([string]$Text)
+    $head = ""
+    $extra = 0
+    $lines = Get-GcrGitTextLines -Text $Text
+    if ($lines.Count -gt 0) {
+        $head = [string]$lines[0]
+        $extra = $lines.Count - 1
+    }
+    if ($head.Length -gt 220) { $head = $head.Substring(0, 217) + "..." }
+    return @{ Head = $head; Extra = $extra }
+}
+
 function Add-DonePaths {
     param([string]$DonePath, [string[]]$Paths)
     if (-not $Paths -or @($Paths).Count -eq 0) { return }
@@ -1291,10 +1400,13 @@ function Invoke-BlobFetch {
     $oidList = New-Object System.Collections.Generic.List[string]
     foreach ($o in $Oids) { if ($o) { [void]$oidList.Add([string]$o) } }
     if ($oidList.Count -eq 0) { return $true }
+    # --progress is what makes git report "Receiving objects: ... 12.34 MiB |
+    # 1.23 MiB/s" even though stderr is a pipe: the TUI shows that line live in
+    # its phase row while the batch is being fetched.
     $baseArgs = @(
         "-c", "fetch.negotiationAlgorithm=noop",
         "-c", "core.quotepath=false",
-        "fetch", "origin", "--no-tags", "--no-write-fetch-head",
+        "fetch", "--progress", "origin", "--no-tags", "--no-write-fetch-head",
         "--recurse-submodules=no", "--filter=blob:none"
     )
     $limit = [Math]::Max(1, $Attempts)
@@ -1314,22 +1426,113 @@ function Invoke-BlobFetch {
             if ($script:GcrUserStop) { throw "已由用户停止。" }
             $r = Invoke-GitProcess -WorkDir $RepoRoot -ExpectFail -GitArgs $gitArgs.ToArray()
             if ($r.ExitCode -eq 0) { $chunkOk = $true; break }
-            $tail = $r.StdErr
-            if ([string]::IsNullOrWhiteSpace($tail)) { $tail = $r.StdOut }
-            $last = "exit " + $r.ExitCode + " : " + $tail.Trim()
+            $err = Get-GcrErrorHead -Text $r.StdErr
+            if (-not $err.Head) { $err = Get-GcrErrorHead -Text $r.StdOut }
+            $last = "exit " + $r.ExitCode + " : " + $err.Head
             if ($i -lt $limit) {
-                Write-Log (Get-GcrText ("按需拉取 " + $chunk.Count + " 个 blob 失败 (第 " + $i + "/" + $limit + " 次): " + $last + " ；" + $delay + "s 后重试") ("Blob fetch for " + $chunk.Count + " blob(s) failed (attempt " + $i + "/" + $limit + "): " + $last + " ; retrying in " + $delay + "s")) "WARN"
+                Write-Log (Get-GcrText ("拉取 " + $chunk.Count + " 个 blob 失败 (第 " + $i + "/" + $limit + " 次): " + $last + " ；" + $delay + "s 后重试") ("Blob fetch for " + $chunk.Count + " blob(s) failed (attempt " + $i + "/" + $limit + "): " + $last + " ; retrying in " + $delay + "s")) "WARN"
                 Start-Sleep -Seconds $delay
                 $delay = [Math]::Min(60, [Math]::Max(1, $delay * 2))
                 Clear-StaleIndexLock -RepoRoot $RepoRoot
             }
         }
         if (-not $chunkOk) {
-            Write-Log (Get-GcrText ("按需拉取 " + $chunk.Count + " 个 blob 未成功: " + $last) ("Blob fetch for " + $chunk.Count + " blob(s) did not succeed: " + $last)) "WARN"
+            Write-Log (Get-GcrText ("拉取 " + $chunk.Count + " 个 blob 未成功: " + $last) ("Blob fetch for " + $chunk.Count + " blob(s) did not succeed: " + $last)) "WARN"
             $allOk = $false
         }
     }
     return $allOk
+}
+
+# Is this object already in the local object database? One `git cat-file
+# --batch-check` process for the whole list (it reads the ids from stdin, which
+# is why Invoke-GitProcess learned to write stdin).
+# GIT_NO_LAZY_FETCH is what keeps the probe offline: without it git starts one
+# lazy fetch per missing object. Anything the probe cannot answer for is
+# reported as missing - fetching an object that is already local costs one
+# round trip, skipping one that is not costs a failed checkout.
+# (The first line of such a batch is answered wrongly on Windows, see the
+# sentinel comment inside the loop.)
+function Get-MissingBlobOids {
+    param([string]$RepoRoot, [string[]]$Oids)
+
+    $missing = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+    if ($null -eq $script:GcrLocalBlobs) {
+        $script:GcrLocalBlobs = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+    }
+    $probe = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+    foreach ($o in $Oids) {
+        if (-not $o) { continue }
+        $s = ([string]$o).Trim()
+        if ($s.Length -lt 4) { continue }
+        if ($script:GcrLocalBlobs.Contains($s)) { continue }
+        if ($seen.Add($s)) { [void]$probe.Add($s) }
+    }
+    if ($probe.Count -eq 0) { return ,$missing }
+
+    $chunkSize = 512
+    for ($start = 0; $start -lt $probe.Count; $start += $chunkSize) {
+        $take = [Math]::Min($chunkSize, $probe.Count - $start)
+        $chunk = $probe.GetRange($start, $take)
+        # git answers the very FIRST line of such a batch wrongly on Windows when
+        # stdin is a pipe written by .NET ("<oid> missing" for whatever oid comes
+        # first, even for an object that is definitely present - reproducible
+        # with a known-local oid, and with the empty tree in an empty repo, while
+        # `type file | git ...` answers correctly). Send the empty tree first and
+        # throw its answer away, then every real answer is trustworthy.
+        $sentinel = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append($sentinel).Append([char]10)
+        foreach ($o in $chunk) { [void]$sb.Append($o).Append([char]10) }
+        $r = Invoke-GitProcess -WorkDir $RepoRoot -ExpectFail `
+            -EnvOverride @{ "GIT_NO_LAZY_FETCH" = "1" } `
+            -GitArgs @("cat-file", "--batch-check") -StdIn $sb.ToString()
+        if ($r.ExitCode -ne 0) {
+            Write-Log (Get-GcrText "无法探测本地 blob，直接尝试拉取。" "Could not probe for local blobs; fetching anyway.") "WARN"
+            foreach ($o in $chunk) { [void]$missing.Add($o) }
+            continue
+        }
+        # Answers come back one line per input line, in the same order.
+        $answers = @($r.StdOut -split "[\r\n]+" | Where-Object { $_.Trim() })
+        $present = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::Ordinal)
+        for ($i = 0; $i -lt $chunk.Count; $i++) {
+            $oid = [string]$chunk[$i]
+            $line = ""
+            if (($i + 1) -lt $answers.Count) { $line = ([string]$answers[$i + 1]).Trim() }
+            $sp = $line.IndexOf(" ")
+            $usable = $false
+            if ($sp -gt 0) {
+                # The echoed name must be the oid we asked about, otherwise the
+                # line belongs to something else and cannot be trusted.
+                if ($line.Substring(0, $sp).Equals($oid, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $usable = ($line.Substring($sp + 1).Trim() -ne "missing")
+                    if ($usable) { [void]$present.Add($oid) }
+                }
+            }
+            if (-not $usable) { [void]$missing.Add($oid) }
+        }
+        foreach ($o in $present) { [void]$script:GcrLocalBlobs.Add($o) }
+    }
+    return ,$missing
+}
+
+# The subset of these entries whose blob still has to come from the remote.
+# A cold batch returns all of them, a resumed one only what really is missing -
+# which is what keeps both the network traffic and the log quiet.
+function Select-GcrEntriesMissingBlobs {
+    param([string]$RepoRoot, $Entries)
+
+    $need = New-Object System.Collections.Generic.List[object]
+    $oids = Get-BatchBlobOids -Batch $Entries
+    if ($null -eq $oids -or $oids.Count -eq 0) { return ,$need }
+    $missing = Get-MissingBlobOids -RepoRoot $RepoRoot -Oids $oids.ToArray()
+    foreach ($e in $Entries) {
+        if ($null -eq $e) { continue }
+        $o = ([string]$e.Blob).Trim()
+        if ($missing.Contains($o)) { [void]$need.Add($e) }
+    }
+    return ,$need
 }
 
 # Fetch the blobs these entries need: whole group first, bisected on failure so
@@ -1341,14 +1544,14 @@ function Prefetch-BatchBlobs {
     if ($null -eq $oids -or $oids.Count -eq 0) { return }
     $nFiles = 0
     foreach ($e in $Entries) { if ($null -ne $e) { $nFiles++ } }
-    Write-Log (Get-GcrText ("按需拉取 " + $oids.Count + " 个 blob（对应 " + $nFiles + " 个路径）") ("Fetching " + $oids.Count + " blob(s) on demand for " + $nFiles + " path(s)")) "INFO"
+    Write-Log (Get-GcrText ("拉取缺失的 " + $oids.Count + " 个 blob（" + $nFiles + " 个路径）") ("Fetching " + $oids.Count + " missing blob(s) for " + $nFiles + " path(s)")) "INFO"
 
     $queue = New-Object System.Collections.Generic.Queue[object]
     $queue.Enqueue([pscustomobject]@{ Oids = $oids; Attempts = [Math]::Max(1, $Attempts) })
     $guard = 0
     while ($queue.Count -gt 0) {
         $guard++
-        if ($guard -gt 512) { Write-Log (Get-GcrText "按需拉取拆分次数过多，剩下的交给 checkout 重试。" "Too many fetch splits; leaving the rest to the checkout retry.") "WARN"; break }
+        if ($guard -gt 512) { Write-Log (Get-GcrText "拉取拆分次数过多，剩下的交给 checkout 重试。" "Too many fetch splits; leaving the rest to the checkout retry.") "WARN"; break }
         $job = $queue.Dequeue()
         $jobOids = $job.Oids
         if ($null -eq $jobOids -or $jobOids.Count -eq 0) { continue }
@@ -1398,7 +1601,9 @@ function Invoke-CheckoutOnce {
     }
     if ($n -le 0) { return }
     Ensure-ParentDirectories -RepoRoot $RepoRoot -Batch $Batch
-    $hb = "downloading " + $n + " file(s), e.g. " + $firstPath
+    # Local write only (the blobs are already here), but a slow disk or a very
+    # long path list still deserves a heartbeat.
+    $hb = "checking out " + $n + " file(s), e.g. " + $firstPath
     # Multi-file checkout: try once. Retrying the same big batch on Windows
     # wastes minutes (cannot create directory) and can desync the index; the
     # caller bisects instead. Single files may use the full retry budget.
@@ -1409,86 +1614,107 @@ function Invoke-CheckoutOnce {
 }
 
 # Check out a group of files and return @{ Ok = <landed>; Bad = <still missing> }.
-# A failing git command does not mean the group failed: we always re-check what
-# actually landed and retry only what is really missing (bisected down to single
-# files), so one bad path never costs a full batch of git invocations.
+# Order matters: the blobs are made local FIRST (one batched request for exactly
+# the ones that are missing), then git only has to write files. Trying the
+# checkout first looks cheaper, but on a partial clone every cold batch is
+# guaranteed to fail with one
+#   error: unable to read sha1 file of <path> (<oid>)
+# per file, which used to fill the log with a scary two-line block per batch
+# even though nothing was wrong.
+# A failing git command still does not mean the group failed: we always re-check
+# what actually landed and retry only what is really missing (bisected down to
+# single files), so one bad path never costs a full batch of git invocations.
 function Complete-CheckoutGroup {
     param(
         [string]$RepoRoot,
         [string]$Sha,
         $Entries,
-        [int]$Depth = 0
+        [int]$Depth = 0,
+        [int]$Attempts = 3
     )
     $items = New-Object System.Collections.Generic.List[object]
     foreach ($e in $Entries) { if ($null -ne $e) { [void]$items.Add($e) } }
     if ($items.Count -eq 0) { return @{ Ok = @(); Bad = @() } }
+    Assert-GcrContinue
 
     $ok = New-Object System.Collections.Generic.List[object]
     $bad = New-Object System.Collections.Generic.List[object]
     $single = ($items.Count -eq 1)
+    $attempts = [Math]::Max(1, $Attempts)
+    if ($single) { $attempts = [Math]::Max(1, $MaxRetries) }
 
-    # 1) local attempt. Blobs are fetched on purpose below, so a blob that is
-    #    missing fails fast here instead of triggering git's lazy fetch (which
-    #    fetches one blob per subprocess and then still reports
-    #    "error: unable to read sha1 file of <path> (<oid>)").
+    # 1) network: every blob this group needs that is not local yet, in one
+    #    request (git's own lazy fetch would spawn one subprocess per file).
+    $need = Select-GcrEntriesMissingBlobs -RepoRoot $RepoRoot -Entries $items
+    if ($need.Count -gt 0) {
+        Prefetch-BatchBlobs -RepoRoot $RepoRoot -Entries $need -Attempts $attempts
+    }
+
+    # 2) local checkout. Blobs are local by now, so this is a plain file write:
+    #    GIT_NO_LAZY_FETCH turns any surprise into a fast failure instead of a
+    #    slow one-file-at-a-time fetch.
+    $checkoutError = $null
     try {
         Invoke-CheckoutOnce -RepoRoot $RepoRoot -Sha $Sha -Batch $items -Retries 1
     } catch {
         if ($script:GcrUserStop) { throw }
-        $msg = [string]$_.Exception.Message
-        if ($single) {
-            Write-Log (Get-GcrText ("单文件 checkout 失败: " + $msg) ("Single-file checkout failed: " + $msg)) "WARN"
-        } else {
-            # Keep one line: a cold batch reports one "unable to read sha1 file of"
-            # per missing file, which is expected and noisy.
-            $head = $msg
-            $extra = ""
-            $lines = @($msg -split "[\r\n]+" | Where-Object { $_.Trim() })
-            if ($lines.Count -gt 0) { $head = [string]$lines[0] }
-            if ($lines.Count -gt 1) {
-                $extra = Get-GcrText (" （另有 " + ($lines.Count - 1) + " 行同类输出）") (" (plus " + ($lines.Count - 1) + " similar lines)")
-            }
-            # NB: keep the call in its own variable - "Get-GcrText (..) (..) + $head"
-            # would let PowerShell treat "+ $head" as a separate argument.
-            $prefix = Get-GcrText ("这一组 (" + $items.Count + " 个路径) 未全部成功；本地缺 blob 时属正常，下面只补缺的: ") ("This group (" + $items.Count + " path(s)) did not fully complete; normal when blobs are missing locally, fetching only what is missing: ")
-            Write-Log ($prefix + $head + $extra) "INFO"
-        }
+        # Deliberately not logged yet: a failing exit code is meaningless until
+        # we know whether the files landed (see below).
+        $checkoutError = [string]$_.Exception.Message
     }
 
-    # 2) trust the worktree, not the exit code
+    # 3) trust the worktree, not the exit code
     $res = Confirm-BatchFiles -RepoRoot $RepoRoot -Batch $items
     foreach ($x in $res.Ok) { [void]$ok.Add($x) }
     $missing = New-Object System.Collections.Generic.List[object]
     foreach ($x in $res.Bad) { [void]$missing.Add($x) }
     if ($missing.Count -eq 0) { return @{ Ok = $ok; Bad = $bad } }
 
-    # 3) network: ask for exactly the blobs those files need (batched + retried)
-    $attempts = 3
-    if ($single) { $attempts = $MaxRetries }
-    Prefetch-BatchBlobs -RepoRoot $RepoRoot -Entries $missing -Attempts $attempts
-
-    # 4) retry only what did not land (single files may use the full budget)
-    $tries = 1
-    if ($single) { $tries = $MaxRetries }
-    try {
-        Invoke-CheckoutOnce -RepoRoot $RepoRoot -Sha $Sha -Batch $missing -Retries $tries
-    } catch {
-        if ($script:GcrUserStop) { throw }
-        Write-Log (Get-GcrText ("重试 checkout 仍有失败: " + $_.Exception.Message) ("Checkout retry still failed: " + $_.Exception.Message)) "WARN"
+    # 4) something really is missing - that is worth a line in the log, and it
+    #    is the only case in which the checkout error is interesting.
+    $err = Get-GcrErrorHead -Text $checkoutError
+    $why = Get-GcrText "checkout 未落盘" "checkout did not create the file"
+    if ($err.Head) { $why = $err.Head }
+    if ($err.Extra -gt 0) {
+        $why = $why + (Get-GcrText (" （另有 " + $err.Extra + " 行同类输出）") (" (plus " + $err.Extra + " similar lines)"))
+    }
+    if ($single) {
+        Write-Log (Get-GcrText ("单文件 checkout 失败: " + $why) ("Single-file checkout failed: " + $why)) "WARN"
+    } else {
+        # NB: keep the call in its own variable - "Get-GcrText (..) (..) + $x"
+        # would let PowerShell treat "+ $x" as a separate argument.
+        $prefix = Get-GcrText ("这一组 (" + $items.Count + " 个路径) 里还有 " + $missing.Count + " 个没落盘，只重试这几个: ") ("This group (" + $items.Count + " path(s)) still misses " + $missing.Count + " path(s); retrying only those: ")
+        Write-Log ($prefix + $why) "WARN"
     }
 
-    $still = New-Object System.Collections.Generic.List[object]
-    foreach ($x in $missing) {
-        if (Test-FileComplete -RepoRoot $RepoRoot -Entry $x) { [void]$ok.Add($x) } else { [void]$still.Add($x) }
+    # 5) one more try for exactly those paths (fetch + checkout), single files
+    #    may use the full retry budget
+    if (-not $single) {
+        $need2 = Select-GcrEntriesMissingBlobs -RepoRoot $RepoRoot -Entries $missing
+        if ($need2.Count -gt 0) {
+            Prefetch-BatchBlobs -RepoRoot $RepoRoot -Entries $need2 -Attempts $attempts
+        }
+        try {
+            Invoke-CheckoutOnce -RepoRoot $RepoRoot -Sha $Sha -Batch $missing -Retries 1
+        } catch {
+            if ($script:GcrUserStop) { throw }
+        }
+        $still = New-Object System.Collections.Generic.List[object]
+        foreach ($x in $missing) {
+            if (Test-FileComplete -RepoRoot $RepoRoot -Entry $x) { [void]$ok.Add($x) } else { [void]$still.Add($x) }
+        }
+        if ($still.Count -eq 0) { return @{ Ok = $ok; Bad = $bad } }
+    } else {
+        $still = $missing
     }
-    if ($still.Count -eq 0) { return @{ Ok = $ok; Bad = $bad } }
+
     if ($single -or $still.Count -eq 1 -or $Depth -ge 8) {
         # nothing left to isolate: report the survivors
         foreach ($x in $still) { [void]$bad.Add($x) }
         return @{ Ok = $ok; Bad = $bad }
     }
 
-    # 5) still incomplete: halve to isolate the problematic path(s)
+    # 6) still incomplete: halve to isolate the problematic path(s)
     $half = [int][Math]::Floor($still.Count / 2)
     if ($half -lt 1) { $half = 1 }
     $parts = New-Object System.Collections.Generic.List[object]
@@ -1496,7 +1722,7 @@ function Complete-CheckoutGroup {
     if ($half -lt $still.Count) { [void]$parts.Add($still.GetRange($half, $still.Count - $half)) }
     foreach ($part in $parts) {
         if ($part.Count -eq 0) { continue }
-        $sub = Complete-CheckoutGroup -RepoRoot $RepoRoot -Sha $Sha -Entries $part -Depth ($Depth + 1)
+        $sub = Complete-CheckoutGroup -RepoRoot $RepoRoot -Sha $Sha -Entries $part -Depth ($Depth + 1) -Attempts ([Math]::Max(1, $attempts - 1))
         foreach ($x in $sub.Ok) { [void]$ok.Add($x) }
         foreach ($x in $sub.Bad) { [void]$bad.Add($x) }
     }
@@ -1583,7 +1809,10 @@ function Repair-GitIndex {
                     [void]$fake.Add([pscustomobject]@{ Path = [string]$e.Path; Blob = [string]$e.Blob })
                 }
             }
-            if ($fake.Count -gt 0) { Prefetch-BatchBlobs -RepoRoot $RepoRoot -Entries $fake.ToArray() -Attempts 2 }
+            if ($fake.Count -gt 0) {
+                $needFix = Select-GcrEntriesMissingBlobs -RepoRoot $RepoRoot -Entries $fake.ToArray()
+                if ($needFix.Count -gt 0) { Prefetch-BatchBlobs -RepoRoot $RepoRoot -Entries $needFix -Attempts 2 }
+            }
         }
         Write-Log ("repair index: re-checkout " + $needCheckout.Count + " missing files") "WARN"
         $gitArgs = New-Object System.Collections.Generic.List[string]
@@ -1640,8 +1869,11 @@ function Write-DownloadProgress {
     }
     $name = [string]$CurrentFile
     if ($name.Length -gt 48) { $name = "..." + $name.Substring($name.Length - 45) }
-    $line = ("[{0}] {1,5:N1}%  {2}/{3}  fail {4}  {5}  {6:N1} files/s  ETA {7}  {8}" -f @(
-        $bar, $pct, $OkCount, $TotalCount, $FailCount, (Format-Bytes $DoneBytes), $rate, $eta, $name
+    $speed = Format-GcrSpeed -BytesPerSecond (Get-GcrSpeedValue)
+    # Bar, percent, counts, failures, bytes on disk, download speed, files/s,
+    # ETA, current file.
+    $line = ("[{0}] {1,5:N1}%  {2}/{3}  fail {4}  {5}  {6}  {7:N1} files/s  ETA {8}  {9}" -f @(
+        $bar, $pct, $OkCount, $TotalCount, $FailCount, (Format-Bytes $DoneBytes), $speed, $rate, $eta, $name
     ))
     $width = 120
     try {
@@ -1653,10 +1885,11 @@ function Write-DownloadProgress {
     elseif ($out.Length -gt $width) { $out = $out.Substring(0, $width) }
     Update-GcrWindowTitle -Ok $OkCount -Total $TotalCount -Fail $FailCount
     if (Test-GcrTuiActive) {
-        Update-GcrTuiProgress -OkCount $OkCount -TotalCount $TotalCount -FailCount $FailCount -DoneBytes $DoneBytes -Rate $rate -Eta $eta -CurrentFile $CurrentFile
+        Update-GcrTuiProgress -OkCount $OkCount -TotalCount $TotalCount -FailCount $FailCount -DoneBytes $DoneBytes -Rate $rate -Eta $eta -CurrentFile $CurrentFile -SpeedBps (Get-GcrSpeedValue)
         Invoke-GcrTuiTick
     } else {
         Write-Host ("`r" + $out) -NoNewline
+        $script:GcrProgressOpen = $true
         Write-Progress -Activity "git-clone-resume" -Status $line -PercentComplete ([Math]::Min(100, [int]$pct))
     }
 }
@@ -2005,6 +2238,7 @@ try {
         $started = Get-Date
         $failCount = 0
         $processedThisRun = 0
+        Reset-GcrSpeedMeter
         Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount 0 -DoneBytes $doneBytes -Elapsed ([TimeSpan]::Zero) -DoneThisRun 0 -CurrentFile "starting download"
 
         $batchIndex = 0
@@ -2019,7 +2253,9 @@ try {
 
             # 先把这批缺的 blob 批量拉全（网络），再本地 checkout；
             # 失败时核对落盘结果并二分重试，不会因一个文件就废弃整批。
+            $batchSw = [System.Diagnostics.Stopwatch]::StartNew()
             $result = Complete-CheckoutGroup -RepoRoot $repoRoot -Sha $pinnedSha -Entries $batch
+            $batchSw.Stop()
             foreach ($x in $result.Ok) { [void]$okThis.Add($x) }
             foreach ($x in $result.Bad) { [void]$badThis.Add($x) }
 
@@ -2043,7 +2279,11 @@ try {
 
             $processedThisRun += $okThis.Count
             $okCount += $okThis.Count
+            $bytesBefore = $doneBytes
             foreach ($e in $okThis) { $doneBytes += (Get-WorktreeBytes -RepoRoot $repoRoot -RelPath $e.Path) }
+            # What this batch put on disk, divided by how long it needed for it:
+            # the number behind "12.3 MB / 1.2 MB/s".
+            Add-GcrSpeedBytes -Bytes ($doneBytes - $bytesBefore) -Span $batchSw.Elapsed.TotalSeconds
 
             $lastName = $batch[$batch.Count - 1].Path
             Write-DownloadProgress -OkCount $okCount -TotalCount $totalCount -FailCount $failCount -DoneBytes $doneBytes -Elapsed ((Get-Date) - $started) -DoneThisRun $processedThisRun -CurrentFile $lastName
@@ -2051,7 +2291,7 @@ try {
                 $pctNow = 0.0
                 if ($totalCount -gt 0) { $pctNow = 100.0 * $okCount / $totalCount }
                 Write-GcrNewline
-                Write-Log (("checkpoint {0}/{1} {2:N1}%  fail {3}  {4}" -f $okCount, $totalCount, $pctNow, $failCount, (Format-Bytes $doneBytes))) "INFO"
+                Write-Log (("checkpoint {0}/{1} {2:N1}%  fail {3}  {4}  {5}" -f $okCount, $totalCount, $pctNow, $failCount, (Format-Bytes $doneBytes), (Format-GcrSpeed -BytesPerSecond (Get-GcrSpeedValue)))) "INFO"
             }
         }
 
@@ -2063,12 +2303,15 @@ try {
         Repair-GitIndex -RepoRoot $repoRoot -Sha $pinnedSha -Entries $filtered
         $elapsed = (Get-Date) - $started
         $elapsedText = "{0:00}:{1:00}:{2:00}" -f [int]$elapsed.TotalHours, $elapsed.Minutes, $elapsed.Seconds
-        Write-Log (Get-GcrText ("完成: 成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText) ("Complete: succeeded {0}/{1}, failed {2}, elapsed {3}" -f $okCount, $totalCount, $failCount, $elapsedText)) "OK"
+        $avgSpeed = 0.0
+        if ($elapsed.TotalSeconds -gt 0.5 -and $doneBytes -gt 0) { $avgSpeed = $doneBytes / $elapsed.TotalSeconds }
+        $avgText = Format-GcrSpeed -BytesPerSecond $avgSpeed
+        Write-Log (Get-GcrText ("完成: 成功 {0}/{1} ，失败 {2} ，耗时 {3} ，平均 {4}" -f $okCount, $totalCount, $failCount, $elapsedText, $avgText) ("Complete: succeeded {0}/{1}, failed {2}, elapsed {3}, average {4}" -f $okCount, $totalCount, $failCount, $elapsedText, $avgText)) "OK"
         Write-Log (Get-GcrText ("工作区: " + $repoRoot) ("Workspace: " + $repoRoot)) "OK"
         [void]$resultBody.Add((Get-GcrText "工作区: " "Workspace: ") + $repoRoot)
         [void]$resultBody.Add((Get-GcrText (
-                    "成功 {0}/{1} ，失败 {2} ，耗时 {3}" -f $okCount, $totalCount, $failCount, $elapsedText) (
-                    "Succeeded {0}/{1}   failed {2}   elapsed {3}" -f $okCount, $totalCount, $failCount, $elapsedText)))
+                    "成功 {0}/{1} ，失败 {2} ，耗时 {3} ，平均 {4}" -f $okCount, $totalCount, $failCount, $elapsedText, $avgText) (
+                    "Succeeded {0}/{1}   failed {2}   elapsed {3}   average {4}" -f $okCount, $totalCount, $failCount, $elapsedText, $avgText)))
         if ($failCount -gt 0) {
             Write-Log (Get-GcrText ("失败列表: " + $failedPath + "  （再次运行本脚本会重试未完成文件）") ("Failure list: " + $failedPath + "  (rerun this script to retry the unfinished files)")) "WARN"
             [void]$resultBody.Add((Get-GcrText "失败列表: " "Failure list: ") + $failedPath)
