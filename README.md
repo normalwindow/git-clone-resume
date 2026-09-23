@@ -22,6 +22,7 @@ English documentation: [README.en.md](README.en.md).
 | `git-clone-resume.tui.ps1` | 全屏 TUI（向导、进度面板、快捷键），由主脚本自动加载 |
 | `git-clone-resume.cmd` | 双击或 cmd 下调用的启动器（无参数会打开 TUI 向导） |
 | `snap/` | README 截图（向导主页面、克隆运行界面） |
+| `bench/` | 性能基准与回归测试，不参与发布包 |
 
 ## 依赖
 
@@ -156,7 +157,43 @@ nature-skills  ·  done (802/802)  ·  git-clone-resume
 | `?` / `H` | 帮助 |
 | `Enter` | 结束页关闭 |
 
-向导里：`Enter` 编辑或开始，`Space` 切换开关，`←` `→` 改批次大小，`Tab` 最近任务，`Ctrl+V` 粘贴 URL，`Q` 退出。高亮某一选项时，底栏上一行会显示该选项的简短说明（Guide）。最近任务列表中：`Enter` 填入续传，`Del` 删除当前条目，`Ctrl+D` 清空全部历史。
+向导里：`Enter` 编辑或开始，`Ctrl+S` 直接开始克隆，`Space` 切换开关，`←` `→` 改批次大小，`Tab` 最近任务，`Ctrl+V` 粘贴 URL，`Q` 退出。高亮某一选项时，底栏上一行会显示该选项的简短说明（Guide）。最近任务列表中：`Enter` 填入续传，`Del` 删除当前条目，`Ctrl+D` 清空全部历史。
+
+`Ctrl+S` 是「开始克隆」的加速键：不管焦点在表单还是最近任务列表、甚至正在编辑某个文本框，它都能直接开始（裸 `S` 在编辑文本时会被当成输入字符，所以底栏推荐用 `Ctrl+S`）。URL 为空时会把你带回 URL 那一行并提示。
+
+向导里还可以直接用鼠标：点某一行就选中并执行它（点 `开始克隆` 等于按 `Enter`，点开关行即切换，点文本框进入编辑），点最近任务列表的某一条即填入表单。按住 `Shift` 再点则保留终端自己的框选行为。克隆一开始就会关掉鼠标上报，所以在进度面板里拖选、复制文本一如既往；也可以用 `GCR_MOUSE=0` 完全关掉鼠标支持。
+
+### 按键响应
+
+按住方向键时，Windows 的自动重复每秒会发来约 30 个事件，比 PowerShell 拼一帧还快。之前是「读一个键 → 重绘一次」，于是队列里积压的事件在松手后还要继续跑完，表现就是「按一下下键，光标过一会儿还在往下走」。
+
+现在改成**先把已经排队的按键一次性全部应用，再重绘一次**。`bench\bench-input.ps1` 用 60 个积压事件实测：
+
+| 处理方式 | 消化整批耗时 | 重绘次数 |
+| --- | --- | --- |
+| 每个事件重绘一次（修改前） | 748 ms | 60 |
+| 按批应用 + 单次重绘（现在） | **47 ms** | **1** |
+
+### 键盘与鼠标是两条独立通路
+
+这一点很关键，也是曾经踩过的坑——**鼠标出问题绝对不能连累键盘**：
+
+- **键盘**走托管 `[Console]::ReadKey`。这条路在任何宿主里都可用，不依赖 P/Invoke，也是改动前一直在用的通路。一次读一个键，但调用方每帧会把已排队的键整批取走，所以不影响上面的批处理效果。
+- **鼠标**只能走 `ReadConsoleInput`（托管 API 完全看不到鼠标），因此只用它来收集点击，并且有三重保险：
+  1. 只在鼠标上报**确实已开启**时才调用；
+  2. 只在 `[Console]::KeyAvailable` 为假（当前没有待处理按键）时才调用——键盘必须始终由 `ReadKey` 排空；
+  3. `ReadConsoleInput` 会连键盘记录一起返回，而**被它取走的记录就没了**。所以一旦读到键盘记录，就计为故障，连续两次立刻**自动关闭鼠标支持**；任何原生调用异常也一样处理。
+
+如果宿主拿不到控制台句柄、或鼠标上报开启失败，**点击功能自动消失，键盘完全不受影响**。`bench\check-native-input.ps1` 会在无控制台环境下验证这些性质（键盘通路不抛异常、已排队的按键不会被鼠标读取方动到、鼠标读取方故障后键盘仍能收到按键）。
+
+遇到输入异常时可以先关掉鼠标支持对照一下：
+
+```powershell
+$env:GCR_MOUSE = "0"; .\git-clone-resume.cmd
+```
+
+`bench\check-keyboard-console.ps1` 会附着到父控制台，检查 `Enable-GcrVt` 设置的那套控制台模式下 `KeyAvailable` / `ReadKey` 是否正常（鼠标开与不开各测一次）。
+
 
 历史记录写在 `%LOCALAPPDATA%\git-clone-resume\history.json`。命令行可用 `-ClearHistory` 清空，不会删除目标仓库或 `.git/partial-resume/` 进度。框线在中文控制台里若变宽，会自动改用 ASCII；也可设 `GCR_ASCII=1` 强制 ASCII。
 
@@ -207,6 +244,43 @@ nature-skills  ·  done (802/802)  ·  git-clone-resume
 - Git LFS 文件 checkout 后如需真正指针内容，请再执行 `git lfs pull`。
 - 若 fetch 阶段就反复 `HTTP/2` / `RPC failed`，脚本已强制 `HTTP/1.1`；仍失败时检查代理、`GIT_SSL_NO_VERIFY` 不要随便开。
 - 想换分支或更新到最新 commit：加 `-ForceRefetch`（会按新 SHA 补下差异文件）。
+
+## 界面性能
+
+TUI 的每一帧都靠 PowerShell 函数拼字符串，所以帧成本几乎完全由「每次调用要付多少函数调用开销」决定。原先有两个热点，现已修掉；下面是在 Windows PowerShell 5.1 上 `bench\bench-frame.ps1` 的实测值（120×40 面板、400 行活动日志）：
+
+| 场景 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 画面完全没变 | 92.9 ms | **8.5 ms** |
+| 每帧多一行日志 | 86.4 ms | **7.3 ms** |
+| 每一行都变（失败列表/改窗口大小） | 72.7 ms | **7.3 ms** |
+| 向导界面 | 85.3 ms | **6.2 ms** |
+
+修复前约 12 fps，低于帧率上限，所以按键和动画都会明显发滞；现在约 120–160 fps，已远高于 60 fps 的目标，真正限制重绘的是 16 ms 的节流阀而不是渲染本身。
+
+1. **字符宽度改成查表**。原来每个字符都要调一次 `Get-GcrCharWidth`，一次调用几微秒；一行 70 字的日志要 ~1.2 ms 才量得出来，一帧 40 行光量宽度就花掉 ~67 ms（占 81 ms 预算的 83%）。现在把同样的判定预先算成一张 65536 项的 `byte[]`（`Get-GcrWidthTable`，启动时建一次约 40 ms），量宽度变成 `for` 循环里的数组下标，没有函数调用。`Format-GcrCell` 也顺手去掉重复计量：旧实现一次格式化要量三遍（自己一遍、`Truncate-GcrDisplay` 里一遍、量结果又一遍）。
+2. **不再每帧重建函数**。`Push-GcrBorder` / `Push-GcrRow` / `WBorder` / `WRow` 原先定义在 `Render-GcrTui` 和 `Render-GcrTuiWizard` **内部**，PowerShell 每次调用外层函数都会重新解析并编译内层函数定义——等于每帧重建四个函数。现在它们住在脚本作用域，通过 `$script:GcrFrame` 共享当前帧，调色板也按界面变体缓存一份，不再每帧新建哈希表并调九次 `Get-GcrColor`。
+
+`Out-GcrFrame` 本来就是按行做差分的（只重画变化的行），这部分没有改动；`bench\test-render.ps1` 会验证「画面没变时一行都不重画」。
+
+### 回归测试
+
+改动集中在渲染与输入热路径上，容易出「看着对、实际错位」的问题，所以配了五个测试套件：
+
+```powershell
+powershell -NoProfile -File bench\test-all.ps1
+```
+
+| 套件 | 检查内容 |
+| --- | --- |
+| `check-bom.ps1` | 两个脚本保留 UTF-8 BOM 且能正常解析（**Windows PowerShell 5.1 会把没有 BOM 的 .ps1 当 ANSI/GBK 读**，中文会变乱码并直接解析失败；编辑工具常会吃掉 BOM） |
+| `test-widthtable.ps1` | 宽度表类型稳定、可缓存，且对全部 65536 个 BMP 码点与 `Get-GcrCharWidth` 逐一一致 |
+| `test-width.ps1` | 宽/截断/填充三个函数与改动前的实现（`bench\legacy\width-reference.ps1`，从 git HEAD 冻结）在 30 个用例上结果一致，覆盖 CJK、全角、谚文、假名、组合字符、制表符、ANSI 着色、边界宽度 0–4 |
+| `test-render.ps1` | 仪表盘与向导在 9 种状态 × 5 种窗口尺寸下都渲染出结构正确的整屏：行数正确、每行宽度恰好等于 `DrawW`、不碰最后一列（避免自动换行滚屏）、边框字符正确，以及帧差分（无变化零重画、改动一行只重画一行） |
+| `test-wizard.ps1` | 向导按键状态机：导航（含按住方向键 / `j` `k` 到边界不回绕）、开关、批次与重试步进、行内编辑、`S` / `Ctrl+S` / `Enter` 开始、`Q` 退出确认，以及鼠标命中表与实际渲染的行一一对应（点某行确实选中该行、点开始行确实开始、点边框是空操作） |
+| `check-native-input.ps1` | P/Invoke 层：`Add-Type` 能编译、三个结构体大小与全部字段偏移与 Win32 一致，且在**没有控制台**的环境下输入层不抛异常、已排队的按键不会被鼠标读取方吞掉 |
+
+`bench\bench-frame.ps1` / `bench-profile.ps1` / `bench-startup.ps1` / `bench-input.ps1` 是可复现的性能基准，`bench\fix-bom.ps1` 可修复被编辑器吃掉 BOM 的脚本。
 
 ## 退出码
 

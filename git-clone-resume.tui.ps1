@@ -15,6 +15,15 @@ $script:GcrOrigTitle = $null
 $script:GcrOrigCursor = $true
 $script:GcrOrigTreatCtrlC = $false
 $script:GcrNativeReady = $false
+$script:GcrMouseReady = $false
+$script:GcrMouseWanted = $null
+# Consecutive mouse reads that saw a keyboard record; at 2 mouse support is retired.
+$script:GcrMouseFaults = 0
+# Console events decoded from ReadConsoleInput, waiting to be consumed. A List
+# rather than a Queue so it can be batch-drained without allocating per item.
+$script:GcrPendingInput = New-Object System.Collections.Generic.List[object]
+# Row -> action map for clickable regions, republished by each wizard render.
+$script:GcrMouseHit = $null
 
 function Get-GcrCharWidth {
     param([char]$Ch)
@@ -35,12 +44,79 @@ function Get-GcrCharWidth {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# Character width table
+# ---------------------------------------------------------------------------
+# Measuring text cell-by-cell through a PowerShell function is the most
+# expensive thing this TUI does. A PowerShell function call costs a few
+# microseconds, so a 70-character log line used to cost ~1.2 ms to measure, and
+# a 40-row frame spent ~67 ms of its ~81 ms budget inside Get-GcrCharWidth alone
+# (~12 fps, which is what made the interface feel sluggish). The table below is
+# exactly the same classification, precomputed once for every BMP code point, so
+# measuring becomes a flat array lookup inside a for loop with no calls.
+#
+# 64K bytes of byte[]; built once and shared for the process lifetime. Use
+# Get-GcrWidthTable rather than calling this when you want the array back:
+# `return $array` makes PowerShell enumerate it, which cost ~20 ms per call on a
+# 64K byte[] even when the table was already built.
+$script:GcrWidthTable = $null
+
+function Get-GcrWidthTable {
+    if ($null -ne $script:GcrWidthTable) { return , $script:GcrWidthTable }
+    $t = New-Object byte[] 65536
+    for ($code = 0; $code -lt 65536; $code++) {
+        if ($code -le 31 -or $code -eq 127) { $t[$code] = 0 }
+        elseif ($code -lt 127) { $t[$code] = 1 }
+        elseif ($code -ge 0x1100 -and (
+                $code -le 0x115F -or
+                $code -eq 0x2329 -or
+                $code -eq 0x232A -or
+                ($code -ge 0x2E80 -and $code -le 0xA4CF -and $code -ne 0x303F) -or
+                ($code -ge 0xAC00 -and $code -le 0xD7A3) -or
+                ($code -ge 0xF900 -and $code -le 0xFAFF) -or
+                ($code -ge 0xFE10 -and $code -le 0xFE19) -or
+                ($code -ge 0xFE30 -and $code -le 0xFE6F) -or
+                ($code -ge 0xFF00 -and $code -le 0xFF60) -or
+                ($code -ge 0xFFE0 -and $code -le 0xFFE6)
+            )) { $t[$code] = 2 }
+        else { $t[$code] = 1 }
+    }
+    $script:GcrWidthTable = $t
+    return , $t
+}
+
+# Kept as an alias so existing callers keep working.
+function Initialize-GcrWidthTable {
+    return , (Get-GcrWidthTable)
+}
+
+# CSI escape sequences, stripped before measuring styled text.
+$script:GcrAnsiRegex = [char]27 + '\[[0-9;?]*[ -/]*[@-~]'
+
+# The width table is built once by Initialize-GcrTui before the first frame, so
+# the hot helpers below index it directly instead of paying for a guard and a
+# function call on every invocation.
 function Get-GcrDisplayWidth {
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return 0 }
-    $plain = [regex]::Replace($Text, [char]27 + '\[[0-9;?]*[ -/]*[@-~]', "")
+    $plain = [regex]::Replace($Text, $script:GcrAnsiRegex, "")
+    if ($plain.Length -eq 0) { return 0 }
+    $rt = $script:GcrWidthTable
+    if ($null -eq $rt) { $rt = Get-GcrWidthTable }
     $w = 0
-    foreach ($ch in $plain.ToCharArray()) { $w += Get-GcrCharWidth $ch }
+    for ($i = 0; $i -lt $plain.Length; $i++) { $w += $rt[$plain[$i]] }
+    return $w
+}
+
+# Width of a string already known to contain no escape sequences. The renderer
+# formats plain text it built itself, so it can skip the regex strip.
+function Get-GcrPlainWidth {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return 0 }
+    $rt = $script:GcrWidthTable
+    if ($null -eq $rt) { $rt = Get-GcrWidthTable }
+    $w = 0
+    for ($i = 0; $i -lt $Text.Length; $i++) { $w += $rt[$Text[$i]] }
     return $w
 }
 
@@ -48,26 +124,51 @@ function Truncate-GcrDisplay {
     param([string]$Text, [int]$Width)
     if ($Width -le 0) { return "" }
     if ([string]::IsNullOrEmpty($Text)) { return "" }
-    if ((Get-GcrDisplayWidth $Text) -le $Width) { return $Text }
+    $rt = $script:GcrWidthTable
+    if ($null -eq $rt) { $rt = Get-GcrWidthTable }
+    $w = 0
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $w += $rt[$Text[$i]]
+        if ($w -gt $Width) { break }
+    }
+    if ($w -le $Width) { return $Text }
     $ellipsis = "..."
     $budget = $Width - 3
     if ($budget -lt 1) { return Truncate-GcrDisplay -Text "." -Width $Width }
-    $sb = New-Object System.Text.StringBuilder
+    # Re-cut against the tighter ellipsis budget.
     $w = 0
-    foreach ($ch in $Text.ToCharArray()) {
-        $cw = Get-GcrCharWidth $ch
+    $take = 0
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $cw = $rt[$Text[$i]]
         if ($w + $cw -gt $budget) { break }
-        [void]$sb.Append($ch)
         $w += $cw
+        $take = $i + 1
     }
-    return $sb.ToString() + $ellipsis
+    return $Text.Substring(0, $take) + $ellipsis
 }
 
 function Format-GcrCell {
     param([string]$Text, [int]$Width)
     if ($Width -le 0) { return "" }
-    $t = Truncate-GcrDisplay -Text ([string]$Text) -Width $Width
-    $w = Get-GcrDisplayWidth $t
+    $rt = $script:GcrWidthTable
+    if ($null -eq $rt) { $rt = Get-GcrWidthTable }
+    $t = [string]$Text
+    # Callers may pass styled text (the width helpers strip escape sequences
+    # before measuring). The IndexOf guard means plain text - the overwhelmingly
+    # common case in the render loop - skips the regex entirely.
+    if ($t.IndexOf($script:GcrEsc) -ge 0) { $t = [regex]::Replace($t, $script:GcrAnsiRegex, "") }
+    # Measure and pad/cut in one scan. The old version measured the text, called
+    # Truncate-GcrDisplay (which measured again) and then measured the result a
+    # third time, tripling the most expensive operation in the renderer.
+    $w = 0
+    for ($i = 0; $i -lt $t.Length; $i++) {
+        $w += $rt[$t[$i]]
+        if ($w -gt $Width) { break }
+    }
+    if ($w -gt $Width) {
+        $t = Truncate-GcrDisplay -Text $t -Width $Width
+        $w = Get-GcrPlainWidth $t
+    }
     if ($w -lt $Width) { $t = $t + (" " * ($Width - $w)) }
     return $t
 }
@@ -157,10 +258,67 @@ public static extern System.IntPtr GetStdHandle(int nStdHandle);
 public static extern bool GetConsoleMode(System.IntPtr hConsoleHandle, out uint lpMode);
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
 public static extern bool SetConsoleMode(System.IntPtr hConsoleHandle, uint dwMode);
+
+// ReadConsoleInput is the only Windows API that reports mouse events; the
+// managed [Console]::ReadKey path sees keyboard input exclusively. The layouts
+// below are the documented Win32 ones (KEY_EVENT_RECORD and MOUSE_EVENT_RECORD
+// are both 16 bytes, INPUT_RECORD is 20 on 64-bit).
+[StructLayout(LayoutKind.Sequential)]
+public struct KEY_EVENT_RECORD {
+    [MarshalAs(UnmanagedType.Bool)] public bool bKeyDown;
+    public ushort wRepeatCount;
+    public ushort wVirtualKeyCode;
+    public ushort wVirtualScanCode;
+    public char UnicodeChar;
+    public uint dwControlKeyState;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct MOUSE_EVENT_RECORD {
+    public short dwMousePositionX;
+    public short dwMousePositionY;
+    public uint dwButtonState;
+    public uint dwControlKeyState;
+    public uint dwEventFlags;
+}
+
+[StructLayout(LayoutKind.Explicit)]
+public struct INPUT_RECORD_UNION {
+    [FieldOffset(0)] public KEY_EVENT_RECORD KeyEvent;
+    [FieldOffset(0)] public MOUSE_EVENT_RECORD MouseEvent;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct INPUT_RECORD {
+    public ushort EventType;
+    public INPUT_RECORD_UNION Event;
+}
+
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode, EntryPoint="ReadConsoleInputW")]
+public static extern bool ReadConsoleInput(System.IntPtr hConsoleInput, [Out] INPUT_RECORD[] lpBuffer, uint nLength, out uint lpNumberOfEventsRead);
+
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool PeekConsoleInput(System.IntPtr hConsoleInput, [Out] INPUT_RECORD[] lpBuffer, uint nLength, out uint lpNumberOfEventsRead);
 "@
     }
     return [GitCloneResume.Native]
 }
+
+# Event types in an INPUT_RECORD.
+$script:GcrInputKeyEvent = 0x0001
+$script:GcrInputMouseEvent = 0x0002
+
+# dwControlKeyState bits.
+$script:GcrShiftPressed = 0x0010
+$script:GcrCtrlPressed = 0x0008
+
+# dwEventFlags values. 0 means a real press/release; 1 is a movement report.
+$script:GcrMouseMoved = 0x0001
+$script:GcrMouseDoubleClick = 0x0002
+$script:GcrMouseWheeled = 0x0004
+
+# dwButtonState bits.
+$script:GcrFromLeft1stButton = 0x0001
 
 function Enable-GcrVt {
     try {
@@ -190,6 +348,67 @@ function Enable-GcrVt {
     } catch {
         return $false
     }
+}
+
+# ---------------------------------------------------------------------------
+# Mouse input
+# ---------------------------------------------------------------------------
+# Mouse reporting is opt-out via GCR_MOUSE=0 and only enabled while a screen that
+# uses clicks is on show. Enabling ENABLE_MOUSE_INPUT makes the console deliver
+# mouse events to the application, which also means the terminal's own
+# click-drag text selection stops working for the duration - that is why the
+# wizard turns it off again as soon as a clone starts (see Show-GcrTuiWizard's
+# exit paths), and why GCR_MOUSE=0 exists.
+function Test-GcrMouseWanted {
+    if ($env:GCR_MOUSE -eq "0") { return $false }
+    return $true
+}
+
+function Enable-GcrMouse {
+    if (-not $script:GcrNativeReady) { return $false }
+    if ($script:GcrMouseReady) { return $true }
+    if (-not (Test-GcrMouseWanted)) { return $false }
+    try {
+        $native = Get-GcrNativeType
+        $hIn = $native::GetStdHandle(-10)
+        if ($hIn -eq [IntPtr]::Zero -or $hIn -eq [IntPtr](-1)) { return $false }
+        $mode = [uint32]0
+        if (-not $native::GetConsoleMode($hIn, [ref]$mode)) { return $false }
+
+        $mouseInput = [uint32]0x0010
+        $quickEdit = [uint32]0x0040
+        # ENABLE_MOUSE_INPUT is the only change needed: it already turns off
+        # QuickEdit, and it must be paired with ENABLE_EXTENDED_FLAGS for the
+        # console to honour the write. Nothing else about the keyboard mode is
+        # touched, so key input behaves exactly as it did before.
+        $extended = [uint32]0x0080
+        $newMode = ($mode -bor $mouseInput -bor $extended) -band (-bnot $quickEdit)
+        if (-not $native::SetConsoleMode($hIn, $newMode)) { return $false }
+
+        # Allocate the record buffer now, so the reader never has to.
+        if ($null -eq $script:GcrInputBuf) {
+            $script:GcrInputBuf = New-Object 'GitCloneResume.Native+INPUT_RECORD[]' 64
+        }
+        $script:GcrMouseReady = $true
+        $script:GcrMouseFaults = 0
+        return $true
+    } catch {
+        $script:GcrMouseReady = $false
+        return $false
+    }
+}
+
+function Disable-GcrMouse {
+    if (-not $script:GcrMouseReady) { return }
+    $script:GcrMouseReady = $false
+    try {
+        $native = Get-GcrNativeType
+        $hIn = $native::GetStdHandle(-10)
+        $mode = [uint32]0
+        if (-not $native::GetConsoleMode($hIn, [ref]$mode)) { return }
+        $mouseInput = [uint32]0x0010
+        [void]$native::SetConsoleMode($hIn, [uint32]($mode -band (-bnot $mouseInput)))
+    } catch { }
 }
 
 function Restore-GcrVt {
@@ -348,6 +567,10 @@ function Initialize-GcrTuiState {
         Screen        = "dash"
         ErrorFlash    = ""
         Sha1Noise     = 0
+        # Raised by S on the dashboard: open the setup wizard again while the
+        # dashboard is idle (waiting for a keypress between batches), so a clone
+        # can be started without relaunching the script.
+        WizardRequested = $false
     }
 }
 
@@ -355,6 +578,9 @@ function Initialize-GcrTui {
     if (Test-GcrTuiActive) { return $true }
     if (-not (Test-GcrTuiAvailable)) { return $false }
     Initialize-GcrTuiState
+    # Build the character-width table once here (~50 ms) rather than letting the
+    # first frame pay for it, so the UI never freezes on its first paint.
+    [void](Get-GcrWidthTable)
     try { $script:GcrOrigTitle = [Console]::Title } catch { }
     try { $script:GcrOrigCursor = [Console]::CursorVisible } catch { }
     try { $script:GcrOrigTreatCtrlC = [Console]::TreatControlCAsInput } catch { }
@@ -839,20 +1065,216 @@ function Out-GcrFrame {
     $script:GcrTui.LastFrameH = $h
 }
 
-function Read-GcrTuiKey {
-    param([int]$TimeoutMs = 0)
+# ---------------------------------------------------------------------------
+# Input
+# ---------------------------------------------------------------------------
+# Keyboard and mouse use two different, independent paths, and that separation is
+# deliberate:
+#
+#   * Keyboard goes through the managed [Console]::ReadKey, which is the proven
+#     path and keeps working in every host. It is read one key at a time, but a
+#     whole burst of already-typed keys is drained per frame by the callers, and
+#     that batching (not the read call) is what keeps a held arrow key
+#     responsive: Windows auto-repeat fires far faster than a PowerShell frame
+#     can be composed, so repainting per event made the queue outlive the
+#     keypress and the highlight kept stepping after the key was released.
+#
+#   * Mouse events are reported only by ReadConsoleInput; the managed API cannot
+#     see them at all. That call is used purely to collect clicks, and it is
+#     only attempted while mouse reporting has actually been enabled and only
+#     when no key is pending - [Console]::ReadKey must stay the one draining keys
+#     from the console, or a key could be consumed by the wrong reader. If the
+#     native call is unavailable for any reason, clicks are simply unavailable
+#     and the keyboard is unaffected.
+$script:GcrInputBuf = $null
+
+# Pumps already-queued console events into $script:GcrPendingInput.
+#
+# Keys come from the managed reader and mouse clicks from ReadConsoleInput. The
+# key read happens first and short-circuits the native call, so the two readers
+# can never race for the same record.
+function Receive-GcrTuiInput {
+    # 1. Keys, via the managed path. One per call; callers loop to drain a burst.
     try {
-        if ($TimeoutMs -le 0) {
-            if ([Console]::KeyAvailable) { return [Console]::ReadKey($true) }
-            return $null
-        }
-        $end = [Environment]::TickCount + $TimeoutMs
-        while ([Environment]::TickCount -lt $end) {
-            if ([Console]::KeyAvailable) { return [Console]::ReadKey($true) }
-            Start-Sleep -Milliseconds 1
+        if ([Console]::KeyAvailable) {
+            $k = [Console]::ReadKey($true)
+            if ($null -ne $k) { [void]$script:GcrPendingInput.Add($k) }
+            return
         }
     } catch { }
-    return $null
+
+    # 2. Mouse, via the native path - only while mouse reporting is on, and only
+    #    when no key was pending (checked above).
+    if (-not $script:GcrMouseReady) { return }
+    Receive-GcrMouseInput
+}
+
+# Collects mouse click records. Movement, wheel and button-release records are
+# dropped; a release reports an empty button state, so requiring the left button
+# to be down keeps one click from being counted twice.
+#
+# ReadConsoleInput returns keyboard records too, and anything this function takes
+# out of the console buffer is gone. Losing a keystroke that way is precisely the
+# failure this code must not have, so a key record is a hard error: mouse support
+# switches itself off, and the managed reader keeps sole ownership of the
+# keyboard. That is the fail-safe: a broken click feature must never cost input.
+function Receive-GcrMouseInput {
+    if ($null -eq $script:GcrInputBuf) { return }
+    try {
+        $native = Get-GcrNativeType
+        $hIn = $native::GetStdHandle(-10)
+        $buf = $script:GcrInputBuf
+        $n = [uint32]0
+        $guard = 0
+        while ($guard -lt 4) {
+            if (-not $native::ReadConsoleInput($hIn, $buf, [uint32]$buf.Length, [ref]$n)) { return }
+            if ($n -le 0) { return }
+            for ($i = 0; $i -lt $n; $i++) {
+                if ($buf[$i].EventType -eq $script:GcrInputKeyEvent) {
+                    $script:GcrMouseFaults++
+                    if ($script:GcrMouseFaults -ge 2) { Disable-GcrMouse }
+                    return
+                }
+                if ($buf[$i].EventType -ne $script:GcrInputMouseEvent) { continue }
+                $me = $buf[$i].Event.MouseEvent
+                if ($me.dwEventFlags -ne 0) { continue }
+                if (([uint32]$me.dwButtonState -band [uint32]$script:GcrFromLeft1stButton) -eq 0) { continue }
+                # Holding Shift keeps the terminal's own text selection usable.
+                if (([uint32]$me.dwControlKeyState -band [uint32]$script:GcrShiftPressed) -ne 0) { continue }
+                [void]$script:GcrPendingInput.Add(@{
+                        Kind = "mouse"
+                        X    = [int]$me.dwMousePositionX
+                        Y    = [int]$me.dwMousePositionY
+                        Ctrl = (([uint32]$me.dwControlKeyState -band [uint32]$script:GcrCtrlPressed) -ne 0)
+                    })
+            }
+            if ($n -lt $buf.Length) { return }
+            $guard++
+        }
+    } catch {
+        # Any native failure retires mouse support rather than risking the keyboard.
+        Disable-GcrMouse
+    }
+}
+
+# Maps a Win32 KEY_EVENT_RECORD onto the ConsoleKeyInfo shape the rest of the
+# TUI already consumes, so Invoke-GcrTuiKey and the wizard need no changes.
+function Convert-GcrKeyEvent {
+    param($KeyEvent)
+    try {
+        $vk = [int]$KeyEvent.wVirtualKeyCode
+        $ctrlState = [uint32]$KeyEvent.dwControlKeyState
+        $mods = [ConsoleModifiers]0
+        if (($ctrlState -band [uint32]0x0008) -ne 0 -or ($ctrlState -band [uint32]0x0004) -ne 0) {
+            $mods = $mods -bor [ConsoleModifiers]::Control
+        }
+        if (($ctrlState -band [uint32]0x0010) -ne 0) { $mods = $mods -bor [ConsoleModifiers]::Shift }
+        if (($ctrlState -band [uint32]0x0001) -ne 0 -or ($ctrlState -band [uint32]0x0002) -ne 0) {
+            $mods = $mods -bor [ConsoleModifiers]::Alt
+        }
+        $key = Convert-GcrVirtualKey -VirtualKey $vk -Modifiers $mods
+        $ch = [char]$KeyEvent.UnicodeChar
+        # Ctrl+letter reports a control character (0x01-0x1A) in UnicodeChar, but
+        # ConsoleKeyInfo carries the plain letter, and Test-GcrCtrlKey compares
+        # Key.ToString() against "C"/"V"/"D". Normalise so those keep working.
+        if (($mods -band [ConsoleModifiers]::Control) -ne 0 -and [int]$ch -ge 1 -and [int]$ch -le 26) {
+            $ch = [char]([int]$ch + 96)
+        }
+        return New-Object System.ConsoleKeyInfo($ch, $key, (($mods -band [ConsoleModifiers]::Shift) -ne 0), (($mods -band [ConsoleModifiers]::Alt) -ne 0), (($mods -band [ConsoleModifiers]::Control) -ne 0))
+    } catch {
+        return $null
+    }
+}
+
+function Convert-GcrVirtualKey {
+    param([int]$VirtualKey, $Modifiers)
+    # ConsoleKey values are numerically identical to the Win32 virtual-key codes
+    # for the range this TUI cares about, so a direct cast is exact. The letters
+    # are the exception: VK_A..VK_Z equal 'A'..'Z' (0x41..0x5A) and ConsoleKey
+    # agrees, but Ctrl+letter arrives with a control-character UnicodeChar, so the
+    # virtual key is the only reliable source for the key itself.
+    if ($VirtualKey -ge 0x41 -and $VirtualKey -le 0x5A) { return [ConsoleKey]$VirtualKey }
+    if ($VirtualKey -ge 0x30 -and $VirtualKey -le 0x39) { return [ConsoleKey]$VirtualKey }
+    switch ($VirtualKey) {
+        0x08 { return [ConsoleKey]::Backspace }
+        0x09 { return [ConsoleKey]::Tab }
+        0x0D { return [ConsoleKey]::Enter }
+        0x1B { return [ConsoleKey]::Escape }
+        0x20 { return [ConsoleKey]::Spacebar }
+        0x21 { return [ConsoleKey]::PageUp }
+        0x22 { return [ConsoleKey]::PageDown }
+        0x23 { return [ConsoleKey]::End }
+        0x24 { return [ConsoleKey]::Home }
+        0x25 { return [ConsoleKey]::LeftArrow }
+        0x26 { return [ConsoleKey]::UpArrow }
+        0x27 { return [ConsoleKey]::RightArrow }
+        0x28 { return [ConsoleKey]::DownArrow }
+        0x2D { return [ConsoleKey]::Insert }
+        0x2E { return [ConsoleKey]::Delete }
+        default { }
+    }
+    if ($VirtualKey -ge 0x70 -and $VirtualKey -le 0x87) { return [ConsoleKey]($VirtualKey - 0x70 + [int][ConsoleKey]::F1) }
+    return [ConsoleKey]::NoName
+}
+
+# Returns the next *keyboard* event, skipping mouse events. Used by the dashboard
+# (keyboard-driven) and by the git-child loop.
+function Read-GcrTuiKey {
+    param([int]$TimeoutMs = 0)
+    $deadline = [Environment]::TickCount + [Math]::Max(0, $TimeoutMs)
+    while ($true) {
+        while ($script:GcrPendingInput.Count -gt 0) {
+            $item = $script:GcrPendingInput[0]
+            $script:GcrPendingInput.RemoveAt(0)
+            if (Test-GcrMouseEvent $item) { continue }
+            if ($null -ne $item) { return $item }
+        }
+        if ([Environment]::TickCount -ge $deadline) { return $null }
+        Receive-GcrTuiInput
+        if ($script:GcrPendingInput.Count -eq 0) { Start-Sleep -Milliseconds 1 }
+    }
+}
+
+# Returns the next event of any kind, so the wizard can react to clicks too.
+function Read-GcrTuiInput {
+    param([int]$TimeoutMs = 0)
+    $deadline = [Environment]::TickCount + [Math]::Max(0, $TimeoutMs)
+    while ($true) {
+        while ($script:GcrPendingInput.Count -gt 0) {
+            $item = $script:GcrPendingInput[0]
+            $script:GcrPendingInput.RemoveAt(0)
+            if ($null -ne $item) { return $item }
+        }
+        if ([Environment]::TickCount -ge $deadline) { return $null }
+        Receive-GcrTuiInput
+        if ($script:GcrPendingInput.Count -eq 0) { Start-Sleep -Milliseconds 1 }
+    }
+}
+
+# Drains everything already queued (without waiting) into the caller's list, so a
+# key-repeat burst is applied as one batch and painted once. Keyboard events are
+# taken one call at a time from the managed reader, so this loops until the
+# console reports no more keys and no more clicks.
+function Receive-GcrTuiInputBatch {
+    param([System.Collections.Generic.List[object]]$Sink)
+    $guard = 0
+    while ($guard -lt 256) {
+        $before = $script:GcrPendingInput.Count
+        Receive-GcrTuiInput
+        if ($script:GcrPendingInput.Count -le $before) { break }
+        while ($script:GcrPendingInput.Count -gt 0) {
+            $item = $script:GcrPendingInput[0]
+            $script:GcrPendingInput.RemoveAt(0)
+            [void]$Sink.Add($item)
+        }
+        $guard++
+    }
+    return $Sink.Count
+}
+
+function Test-GcrMouseEvent {
+    param($Item)
+    return ($null -ne $Item -and $Item -is [hashtable] -and $Item.Kind -eq "mouse")
 }
 
 function Test-GcrCtrlKey {
@@ -991,6 +1413,91 @@ function Wait-GcrTuiPaused {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Frame composition
+# ---------------------------------------------------------------------------
+# These helpers used to be nested functions *inside* Render-GcrTui and
+# Render-GcrTuiWizard. PowerShell re-parses and re-compiles a nested function on
+# every call of its parent, so the render loop was rebuilding four function
+# definitions per frame. They now live at script scope and share the frame being
+# built through $script:GcrFrame, set up once per render.
+#
+# $lines is the List[string] the renderer appends to and finally hands to
+# Out-GcrFrame, so callers can read $lines.Count to know how many rows they have
+# consumed instead of re-measuring the frame. Frame state is created fresh by
+# Start-GcrFrame on every render and the palettes are cached per process, so
+# nothing here needs initializing at file scope.
+$script:GcrFramePalettes = @{}
+
+function Start-GcrFrame {
+    param([int]$Width, [int]$Inner, $Box, $Palette)
+    $script:GcrFrame = @{
+        Lines   = New-Object System.Collections.Generic.List[string]
+        Box     = $Box
+        Inner   = $Inner
+        Width   = $Width
+        Palette = $Palette
+    }
+}
+
+# One palette per screen variant, built on first use. This replaced a per-frame
+# hashtable plus nine Get-GcrColor calls (each a function call containing a
+# switch).
+function Get-GcrFramePalette {
+    param([string]$Variant = "dash")
+    $cached = $script:GcrFramePalettes[$Variant]
+    if ($null -ne $cached) { return $cached }
+    $p = @{
+        R   = Get-GcrColor "reset"
+        B   = Get-GcrColor "bold"
+        D   = Get-GcrColor "dim"
+        C   = Get-GcrColor "cyan"
+        G   = Get-GcrColor "green"
+        Y   = Get-GcrColor "yellow"
+        E   = Get-GcrColor "red"
+        W   = Get-GcrColor "white"
+        REV = Get-GcrColor "rev"
+    }
+    if ($Variant -eq "dash") { $p.T = Get-GcrColor "teal" }
+    $script:GcrFramePalettes[$Variant] = $p
+    return $p
+}
+
+function Push-GcrBorder {
+    param([string]$Kind)
+    $f = $script:GcrFrame
+    $box = $f.Box
+    $ch = $box.H
+    if ($Kind -eq "top") { $plain = $box.TL + ($ch * $f.Inner) + $box.TR }
+    elseif ($Kind -eq "bot") { $plain = $box.BL + ($ch * $f.Inner) + $box.BR }
+    else { $plain = $box.L + ($ch * $f.Inner) + $box.R }
+    [void]$f.Lines.Add($f.Palette.D + (Format-GcrCell -Text $plain -Width $f.Width) + $f.Palette.R)
+}
+
+function Push-GcrRow {
+    param([string]$Left, [string]$Right = "", [string]$Color = "")
+    $f = $script:GcrFrame
+    $box = $f.Box
+    $c = $f.Palette
+    if (-not $Color) { $Color = $c.W }
+    $Left = Convert-GcrText $Left
+    $Right = Convert-GcrText $Right
+    $leftW = Get-GcrDisplayWidth $Left
+    $rightW = Get-GcrDisplayWidth $Right
+    $gap = $f.Inner - $leftW - $rightW
+    if ($gap -lt 1) {
+        $keep = [Math]::Max(8, $f.Inner - $rightW - 1)
+        $Left = Truncate-GcrDisplay -Text $Left -Width $keep
+        $leftW = Get-GcrDisplayWidth $Left
+        $gap = $f.Inner - $leftW - $rightW
+        if ($gap -lt 0) { $Right = ""; $rightW = 0; $gap = $f.Inner - $leftW }
+        if ($gap -lt 0) { $gap = 0 }
+    }
+    $body = $Left + (" " * $gap) + $Right
+    $v = $box.V
+    [void]$f.Lines.Add($c.D + $v + $c.R + $Color + $body + $c.R + $c.D + $v + $c.R)
+}
+
 function Get-GcrDashGuide {
     if ($script:GcrTui.Help) { return "快捷键说明。任意键关闭此帮助。" }
     if ($script:GcrTui.FailView) { return "失败文件列表。F 返回活动日志，再次运行同一命令会重试。" }
@@ -1034,49 +1541,11 @@ function Render-GcrTui {
     $h = $size.H
     $script:GcrTui.Width = $size.W
     $script:GcrTui.Height = $h
-    $c = @{
-        R = Get-GcrColor "reset"
-        B = Get-GcrColor "bold"
-        D = Get-GcrColor "dim"
-        C = Get-GcrColor "cyan"
-        G = Get-GcrColor "green"
-        Y = Get-GcrColor "yellow"
-        E = Get-GcrColor "red"
-        W = Get-GcrColor "white"
-        T = Get-GcrColor "teal"
-    }
+    $c = Get-GcrFramePalette "dash"
     $box = $script:GcrTui.Box
-    $lines = New-Object System.Collections.Generic.List[string]
     $inner = [Math]::Max(10, $w - 2)
-    function Push-GcrBorder {
-        param([string]$Kind)
-        $ch = $box.H
-        if ($Kind -eq "top") { $plain = $box.TL + ($ch * $inner) + $box.TR }
-        elseif ($Kind -eq "bot") { $plain = $box.BL + ($ch * $inner) + $box.BR }
-        else { $plain = $box.L + ($ch * $inner) + $box.R }
-        [void]$lines.Add($c.D + (Format-GcrCell $plain $w) + $c.R)
-    }
-    function Push-GcrRow {
-        param([string]$Left, [string]$Right = "", [string]$Color = "")
-        if (-not $Color) { $Color = $c.W }
-        $Left = Convert-GcrText $Left
-        $Right = Convert-GcrText $Right
-        $leftW = Get-GcrDisplayWidth $Left
-        $rightW = Get-GcrDisplayWidth $Right
-        $gap = $inner - $leftW - $rightW
-        if ($gap -lt 1) {
-            $keep = [Math]::Max(8, $inner - $rightW - 1)
-            $Left = Truncate-GcrDisplay $Left $keep
-            $leftW = Get-GcrDisplayWidth $Left
-            $gap = $inner - $leftW - $rightW
-            if ($gap -lt 0) { $Right = ""; $rightW = 0; $gap = $inner - $leftW }
-            if ($gap -lt 0) { $gap = 0 }
-        }
-        $body = $Left + (" " * $gap) + $Right
-        $plainSides = $box.V
-        $row = $c.D + $plainSides + $c.R + $Color + $body + $c.R + $c.D + $plainSides + $c.R
-        [void]$lines.Add($row)
-    }
+    Start-GcrFrame -Width $w -Inner $inner -Box $box -Palette $c
+    $lines = $script:GcrFrame.Lines
 
     $badge = "RUN"
     $badgeC = $c.C
@@ -1423,39 +1892,35 @@ function ConvertFrom-GcrWizardOutput {
     return $null
 }
 
+# Wizard rows are built with the same frame state as the dashboard, so the
+# row/border helpers are shared instead of being redefined on every render.
+function WBorder {
+    param([string]$Kind)
+    Push-GcrBorder -Kind $Kind
+}
+
+function WRow {
+    param([string]$Text, [string]$Color, [switch]$Sel)
+    $f = $script:GcrFrame
+    $c = $f.Palette
+    if (-not $Color) { $Color = $c.W }
+    $Text = Convert-GcrText $Text
+    $body = Format-GcrCell -Text $Text -Width $f.Inner
+    if ($Sel) { $Color = $c.REV + $Color }
+    $v = $f.Box.V
+    [void]$f.Lines.Add($c.D + $v + $c.R + $Color + $body + $c.R + $c.D + $v + $c.R)
+}
+
 function Render-GcrTuiWizard {
     param($St)
     $size = Get-GcrTuiSize
     $w = $size.DrawW
     $h = $size.H
     $inner = [Math]::Max(10, $w - 2)
-    $c = @{
-        R = Get-GcrColor "reset"
-        B = Get-GcrColor "bold"
-        D = Get-GcrColor "dim"
-        C = Get-GcrColor "cyan"
-        G = Get-GcrColor "green"
-        Y = Get-GcrColor "yellow"
-        E = Get-GcrColor "red"
-        W = Get-GcrColor "white"
-    }
+    $c = Get-GcrFramePalette "wizard"
     $box = $script:GcrTui.Box
-    $lines = New-Object System.Collections.Generic.List[string]
-    function WBorder([string]$Kind) {
-        $ch = $box.H
-        if ($Kind -eq "top") { $plain = $box.TL + ($ch * $inner) + $box.TR }
-        elseif ($Kind -eq "bot") { $plain = $box.BL + ($ch * $inner) + $box.BR }
-        else { $plain = $box.L + ($ch * $inner) + $box.R }
-        [void]$lines.Add($c.D + (Format-GcrCell $plain $w) + $c.R)
-    }
-    function WRow([string]$Text, [string]$Color, [switch]$Sel) {
-        if (-not $Color) { $Color = $c.W }
-        $Text = Convert-GcrText $Text
-        $body = Format-GcrCell -Text $Text -Width $inner
-        if ($Sel) { $Color = (Get-GcrColor "rev") + $Color }
-        $row = $c.D + $box.V + $c.R + $Color + $body + $c.R + $c.D + $box.V + $c.R
-        [void]$lines.Add($row)
-    }
+    Start-GcrFrame -Width $w -Inner $inner -Box $box -Palette $c
+    $lines = $script:GcrFrame.Lines
 
     $items = Get-GcrWizardItems -St $St
     WBorder "top"
@@ -1481,6 +1946,9 @@ function Render-GcrTuiWizard {
         if ($top -lt 0) { $top = 0 }
         $St.Scroll = $top
     }
+    # Rows the user can click, rebuilt on every render: terminal row
+    # number (1-based) -> the wizard action for that row.
+    $clickable = @{}
     $end = [Math]::Min($formEnd, $top + $maxFormVisible - 1)
     for ($i = $top; $i -le $end; $i++) {
         $it = $items[$i]
@@ -1503,7 +1971,10 @@ function Render-GcrTuiWizard {
         $text = $mark + " " + $label + " " + $val
         $col = $c.W
         if ($it.Kind -eq "start") { $col = $c.G + $c.B }
+        # Remember which terminal row this item occupies.
+        $rowIndex = $lines.Count
         WRow $text $col -Sel:($sel -eq $i -and -not $St.Edit)
+        $clickable[$rowIndex + 1] = @{ Kind = "item"; Index = $i; Id = [string]$it.Id }
     }
 
     WBorder "mid"
@@ -1547,7 +2018,9 @@ function Render-GcrTuiWizard {
             $isSel = ($St.Focus -eq "recent" -and [int]$St.RecentSel -eq $r)
             if ($isSel) { $mark = "  " + $script:GcrTui.Box.Pointer + " " }
             $text = $mark + $name + "  " + $stt + " " + $pct + "  " + $ago
+            $rowIndex = $lines.Count
             WRow $text $(if ($isSel) { $c.C } else { $c.D }) -Sel:$isSel
+            $clickable[$rowIndex + 1] = @{ Kind = "recent"; Index = $r }
             $recentSlots--
         }
     }
@@ -1560,17 +2033,18 @@ function Render-GcrTuiWizard {
     if ($St.Error) { $guideColor = $c.E }
     if ($St.ConfirmQuit -or $St.ConfirmClearAll -or $St.ConfirmClearOne) { $guideColor = $c.Y }
     WRow (" " + $guide) $guideColor
-    $foot = " Enter 编辑/开始  ·  Space 开关  ·  ←→ 改批次  ·  Ctrl+V 粘贴  ·  Q 退出"
-    if ($St.Edit) { $foot = " Enter 确认  ·  Esc 取消  ·  Ctrl+V 粘贴" }
+    $foot = " Enter 编辑/开始  ·  Ctrl+S 开始克隆  ·  Space 开关  ·  ←→ 改批次  ·  Q 退出"
+    if ($St.Edit) { $foot = " Enter 确认  ·  Ctrl+S 开始克隆  ·  Esc 取消" }
     if ($St.ConfirmQuit) { $foot = " Enter 确定退出  ·  Esc 返回" }
     if ($St.ConfirmClearAll -or $St.ConfirmClearOne) { $foot = " Enter 确定  ·  Esc 取消" }
     if ($St.Focus -eq "recent" -and -not $St.ConfirmQuit -and -not $St.ConfirmClearAll -and -not $St.ConfirmClearOne -and -not $St.Edit) {
-        $foot = " Enter 填入  ·  Del 删除  ·  Ctrl+D 清空  ·  Tab 返回  ·  Q 退出"
+        $foot = " Enter 填入  ·  Ctrl+S 开始克隆  ·  Del 删除  ·  Tab 返回  ·  Q 退出"
     }
     WRow $foot $c.D
     WBorder "bot"
     while ($lines.Count -gt $h) { $lines.RemoveAt($lines.Count - 1) }
     while ($lines.Count -lt $h) { [void]$lines.Add("") }
+    $script:GcrMouseHit = $clickable
     Out-GcrFrame -Lines $lines.ToArray()
 }
 
@@ -1596,9 +2070,15 @@ function Get-GcrWizardItems {
 function Apply-GcrRecentToWizard {
     param($St, $Item)
     if ($null -eq $Item) { return }
-    if ($Item.url) { $St.Url = [string]$Item.url }
-    if ($Item.outDir) { $St.OutDir = [string]$Item.outDir; $St.OutDirAuto = $false }
-    if ($Item.ref) { $St.Ref = [string]$Item.ref }
+    # Old history entries may lack any of these fields, and StrictMode makes a
+    # bare property read on a missing key a terminating error, so read defensively.
+    $u = $null; $d = $null; $rf = $null
+    try { $u = [string]$Item.url } catch { }
+    try { $d = [string]$Item.outDir } catch { }
+    try { $rf = [string]$Item.ref } catch { }
+    if ($u) { $St.Url = $u }
+    if ($d) { $St.OutDir = $d; $St.OutDirAuto = $false }
+    if ($rf) { $St.Ref = $rf }
     $St.Focus = "form"
     $St.Sel = 12
 }
@@ -1671,9 +2151,14 @@ function Show-GcrTuiWizard {
         $st.Depth = [string]$Defaults.Depth
     }
 
-    $batches = @(8, 16, 32, 64, 128, 256)
-    $retriesSet = @(3, 5, 8, 12, 20)
+    # Reused for every input burst, so a key-repeat flood does not allocate.
+    $batch = New-Object System.Collections.Generic.List[object]
     $dirty = $true
+
+    # Click-to-select is only wired up while the wizard is on screen; mouse
+    # reporting is switched off again the moment a clone starts, so click-drag
+    # text selection works normally on the dashboard.
+    [void](Enable-GcrMouse)
 
     while ($true) {
         if ($st.OutDirAuto -and $st.Url) {
@@ -1690,269 +2175,365 @@ function Show-GcrTuiWizard {
             Render-GcrTuiWizard -St $st
             $dirty = $false
         }
-        $k = Read-GcrTuiKey -TimeoutMs 16
-        if ($null -eq $k) { continue }
+        # Drain everything already queued and apply it as one batch, then paint
+        # once. A held arrow key auto-repeats far faster than a PowerShell frame
+        # can be composed; repainting per event made the queue outlive the
+        # keypress, so the highlight kept moving after the user let go.
+        $batch.Clear()
+        [void](Receive-GcrTuiInputBatch -Sink $batch)
+        if ($batch.Count -eq 0) {
+            $ev = Read-GcrTuiInput -TimeoutMs 16
+            if ($null -ne $ev) { [void]$batch.Add($ev) }
+        }
+        if ($batch.Count -eq 0) { continue }
         $dirty = $true
 
-        if ($st.ConfirmQuit) {
-            if ($k.Key -eq "Enter" -or $k.Key -eq "Y" -or $k.Key -eq "Q") { return $null }
-            $st.ConfirmQuit = $false
-            continue
-        }
-        if ($st.ConfirmClearAll) {
-            if ($k.Key -eq "Enter" -or $k.Key -eq "Y") {
-                $n = Clear-GcrHistory
-                $st.Recent = @()
-                $st.RecentSel = 0
-                $st.RecentTop = 0
-                $st.Focus = "form"
-                if ($n -gt 0) { $st.Error = "已清除全部历史记录。" }
-                else { $st.Error = "没有可清除的历史记录。" }
+        $action = "continue"
+        foreach ($ev in $batch) {
+            if (Test-GcrMouseEvent $ev) {
+                $action = Invoke-GcrWizardMouse -St $st -X ([int]$ev.X) -Y ([int]$ev.Y)
+            } else {
+                $action = Invoke-GcrWizardEvent -St $st -K $ev
             }
-            $st.ConfirmClearAll = $false
-            continue
+            if ($action -eq "start" -or $action -eq "close") { break }
         }
-        if ($st.ConfirmClearOne) {
-            if ($k.Key -eq "Enter" -or $k.Key -eq "Y") {
-                if ($st.Recent.Count -gt 0 -and $st.RecentSel -ge 0 -and $st.RecentSel -lt $st.Recent.Count) {
-                    $item = $st.Recent[$st.RecentSel]
-                    $urlDel = ""
-                    $dirDel = ""
-                    try { $urlDel = [string]$item.url } catch { }
-                    try { $dirDel = [string]$item.outDir } catch { }
-                    if (Remove-GcrHistoryEntry -Url $urlDel -OutDir $dirDel) {
-                        $st.Recent = @(Get-GcrHistory)
-                        if ($st.RecentSel -ge $st.Recent.Count) { $st.RecentSel = [Math]::Max(0, $st.Recent.Count - 1) }
-                        if ($st.Recent.Count -eq 0) { $st.Focus = "form" }
-                        $st.Error = "已删除该历史记录。"
-                    }
-                }
-            }
-            $st.ConfirmClearOne = $false
-            continue
+        if ($action -eq "close") {
+            Disable-GcrMouse
+            $script:GcrTui.Screen = "dash"
+            return $null
         }
-        if ($st.Edit) {
-            $buf = [string]$st.EditBuf
-            $cur = [int]$st.EditCur
-            if ($cur -lt 0) { $cur = 0 }
-            if ($cur -gt $buf.Length) { $cur = $buf.Length }
-            if ($k.Key -eq "Escape") { $st.Edit = $false; continue }
-            if ($k.Key -eq "Enter") {
-                $val = $buf
-                switch ($st.EditField) {
-                    "url" { $st.Url = $val.Trim() }
-                    "dir" {
-                        $st.OutDir = $val.Trim()
-                        $st.OutDirAuto = [string]::IsNullOrWhiteSpace($st.OutDir)
-                    }
-                    "ref" { $st.Ref = $(if ($val.Trim()) { $val.Trim() } else { "HEAD" }) }
-                    "include" { $st.Include = $val.Trim() }
-                    "exclude" { $st.Exclude = $val.Trim() }
-                    "depth" { $st.Depth = $val.Trim() }
-                }
-                $st.Edit = $false
-                continue
-            }
-            if (Test-GcrCtrlKey $k "V") {
-                $paste = Get-GcrClipboardText
-                if ($paste) {
-                    $paste = ($paste -split "[\r\n]")[0]
-                    $buf = $buf.Substring(0, $cur) + $paste + $buf.Substring($cur)
-                    $cur = $cur + $paste.Length
-                }
-            } elseif ($k.Key -eq "LeftArrow") {
-                if ($cur -gt 0) { $cur-- }
-            } elseif ($k.Key -eq "RightArrow") {
-                if ($cur -lt $buf.Length) { $cur++ }
-            } elseif ($k.Key -eq "Home") { $cur = 0 }
-            elseif ($k.Key -eq "End") { $cur = $buf.Length }
-            elseif ($k.Key -eq "Backspace") {
-                if ($cur -gt 0) { $buf = $buf.Remove($cur - 1, 1); $cur-- }
-            } elseif ($k.Key -eq "Delete") {
-                if ($cur -lt $buf.Length) { $buf = $buf.Remove($cur, 1) }
-            } elseif (-not [string]::IsNullOrEmpty([string]$k.KeyChar) -and [int][char]$k.KeyChar -ge 32) {
-                $buf = $buf.Insert($cur, [string]$k.KeyChar)
-                $cur++
-            }
-            $st.EditBuf = $buf
-            $st.EditCur = $cur
-            continue
+        if ($action -eq "start") {
+            Disable-GcrMouse
+            $wizResult = Convert-GcrWizardResult -St $st
+            $script:GcrTui.Screen = "dash"
+            $script:GcrTui.Logs.Clear()
+            return ,$wizResult
         }
+    }
+    # Not normally reached (both exits above return), but leaving mouse reporting
+    # on would break click-drag text selection for the rest of the session.
+    Disable-GcrMouse
+    return $null
+}
 
-        if (Test-GcrCtrlKey $k "C") { $st.ConfirmQuit = $true; continue }
-        if (Test-GcrCtrlKey $k "D") {
-            if ($st.Recent.Count -gt 0) { $st.ConfirmClearAll = $true }
+# Applies one wizard input event to the wizard state and reports what the caller
+# should do: "continue" to keep the wizard open, "close" to abandon it, or
+# "start" to begin the clone. Extracted from the wizard loop so a whole burst of
+# queued events can be applied in one pass before anything is painted.
+function Invoke-GcrWizardEvent {
+    param($St, $K)
+    # Ladders for the numeric fields, used by the Left/RightArrow handling below.
+    $batches = @(8, 16, 32, 64, 128, 256)
+    $retriesSet = @(3, 5, 8, 12, 20)
+    if ($st.ConfirmQuit) {
+        if ($K.Key -eq "Enter" -or $K.Key -eq "Y" -or $K.Key -eq "Q") { return "close" }
+        $st.ConfirmQuit = $false
+        return "continue"
+    }
+    if ($st.ConfirmClearAll) {
+        if ($K.Key -eq "Enter" -or $K.Key -eq "Y") {
+            $n = Clear-GcrHistory
+            $st.Recent = @()
+            $st.RecentSel = 0
+            $st.RecentTop = 0
+            $st.Focus = "form"
+            if ($n -gt 0) { $st.Error = "已清除全部历史记录。" }
             else { $st.Error = "没有可清除的历史记录。" }
-            continue
         }
-        if (Test-GcrCtrlKey $k "V" -and $st.Focus -eq "form") {
-            $paste = Get-GcrClipboardText
-            if (Test-GcrRepoUrlText $paste) {
-                $st.Url = $paste
-                if ($st.OutDirAuto) { $st.OutDir = Get-GcrFolderNameSafe -Url $paste }
+        $st.ConfirmClearAll = $false
+        return "continue"
+    }
+    if ($st.ConfirmClearOne) {
+        if ($K.Key -eq "Enter" -or $K.Key -eq "Y") {
+            if ($st.Recent.Count -gt 0 -and $st.RecentSel -ge 0 -and $st.RecentSel -lt $st.Recent.Count) {
+                $item = $st.Recent[$st.RecentSel]
+                $urlDel = ""
+                $dirDel = ""
+                try { $urlDel = [string]$item.url } catch { }
+                try { $dirDel = [string]$item.outDir } catch { }
+                if (Remove-GcrHistoryEntry -Url $urlDel -OutDir $dirDel) {
+                    $st.Recent = @(Get-GcrHistory)
+                    if ($st.RecentSel -ge $st.Recent.Count) { $st.RecentSel = [Math]::Max(0, $st.Recent.Count - 1) }
+                    if ($st.Recent.Count -eq 0) { $st.Focus = "form" }
+                    $st.Error = "已删除该历史记录。"
+                }
             }
-            continue
         }
+        $st.ConfirmClearOne = $false
+        return "continue"
+    }
+    # Ctrl+S starts the clone from anywhere, including while a field is being
+    # edited: it is the accelerator for the "开始克隆" row, so unlike a bare S it
+    # works even when a text field has the caret. Checked before the switch and
+    # before the edit branch, because Ctrl+S reports ConsoleKey S.
+    if (Test-GcrCtrlKey $K "S") {
+        if ([string]::IsNullOrWhiteSpace($st.Url) -or $st.Url -match "\s") {
+            $st.Error = "请填写仓库 URL（Ctrl+V 可从剪贴板粘贴）"
+            $st.Sel = 0
+            return "continue"
+        }
+        return "start"
+    }
 
-        switch ($k.Key.ToString()) {
-            "Q" { $st.ConfirmQuit = $true }
-            "Escape" { $st.ConfirmQuit = $true }
-            "Delete" {
-                if ($st.Focus -eq "recent" -and $st.Recent.Count -gt 0) { $st.ConfirmClearOne = $true }
-                elseif ($st.Recent.Count -gt 0) { $st.ConfirmClearAll = $true }
-                else { $st.Error = "没有可清除的历史记录。" }
+    if ($st.Edit) {
+        $buf = [string]$st.EditBuf
+        $cur = [int]$st.EditCur
+        if ($cur -lt 0) { $cur = 0 }
+        if ($cur -gt $buf.Length) { $cur = $buf.Length }
+        if ($K.Key -eq "Escape") { $st.Edit = $false; return "continue" }
+        if ($K.Key -eq "Enter") {
+            $val = $buf
+            switch ($st.EditField) {
+                "url" { $st.Url = $val.Trim() }
+                "dir" {
+                    $st.OutDir = $val.Trim()
+                    $st.OutDirAuto = [string]::IsNullOrWhiteSpace($st.OutDir)
+                }
+                "ref" { $st.Ref = $(if ($val.Trim()) { $val.Trim() } else { "HEAD" }) }
+                "include" { $st.Include = $val.Trim() }
+                "exclude" { $st.Exclude = $val.Trim() }
+                "depth" { $st.Depth = $val.Trim() }
             }
-            "Tab" {
-                if ($st.Focus -eq "form") { $st.Focus = "recent"; if ($st.Recent.Count -eq 0) { $st.Focus = "form" } }
-                else { $st.Focus = "form" }
+            $st.Edit = $false
+            return "continue"
+        }
+        if (Test-GcrCtrlKey $K "V") {
+            $paste = Get-GcrClipboardText
+            if ($paste) {
+                $paste = ($paste -split "[\r\n]")[0]
+                $buf = $buf.Substring(0, $cur) + $paste + $buf.Substring($cur)
+                $cur = $cur + $paste.Length
             }
-            "UpArrow" {
-                if ($st.Focus -eq "recent") {
-                    if ($st.RecentSel -gt 0) {
-                        $st.RecentSel--
-                        if ($st.RecentSel -lt $st.RecentTop) { $st.RecentTop = $st.RecentSel }
+        } elseif ($K.Key -eq "LeftArrow") {
+            if ($cur -gt 0) { $cur-- }
+        } elseif ($K.Key -eq "RightArrow") {
+            if ($cur -lt $buf.Length) { $cur++ }
+        } elseif ($K.Key -eq "Home") { $cur = 0 }
+        elseif ($K.Key -eq "End") { $cur = $buf.Length }
+        elseif ($K.Key -eq "Backspace") {
+            if ($cur -gt 0) { $buf = $buf.Remove($cur - 1, 1); $cur-- }
+        } elseif ($K.Key -eq "Delete") {
+            if ($cur -lt $buf.Length) { $buf = $buf.Remove($cur, 1) }
+        } elseif (-not [string]::IsNullOrEmpty([string]$K.KeyChar) -and [int][char]$K.KeyChar -ge 32) {
+            $buf = $buf.Insert($cur, [string]$K.KeyChar)
+            $cur++
+        }
+        $st.EditBuf = $buf
+        $st.EditCur = $cur
+        return "continue"
+    }
+
+        if (Test-GcrCtrlKey $K "C") { $st.ConfirmQuit = $true; return "continue" }
+    if (Test-GcrCtrlKey $K "D") {
+        if ($st.Recent.Count -gt 0) { $st.ConfirmClearAll = $true }
+        else { $st.Error = "没有可清除的历史记录。" }
+        return "continue"
+    }
+    if (Test-GcrCtrlKey $K "V" -and $st.Focus -eq "form") {
+        $paste = Get-GcrClipboardText
+        if (Test-GcrRepoUrlText $paste) {
+            $st.Url = $paste
+            if ($st.OutDirAuto) { $st.OutDir = Get-GcrFolderNameSafe -Url $paste }
+        }
+        return "continue"
+    }
+
+    switch ($K.Key.ToString()) {
+        "Q" { $st.ConfirmQuit = $true }
+        "Escape" { $st.ConfirmQuit = $true }
+        "Delete" {
+            if ($st.Focus -eq "recent" -and $st.Recent.Count -gt 0) { $st.ConfirmClearOne = $true }
+            elseif ($st.Recent.Count -gt 0) { $st.ConfirmClearAll = $true }
+            else { $st.Error = "没有可清除的历史记录。" }
+        }
+        "Tab" {
+            if ($st.Focus -eq "form") { $st.Focus = "recent"; if ($st.Recent.Count -eq 0) { $st.Focus = "form" } }
+            else { $st.Focus = "form" }
+        }
+        "UpArrow" {
+            if ($st.Focus -eq "recent") {
+                if ($st.RecentSel -gt 0) {
+                    $st.RecentSel--
+                    if ($st.RecentSel -lt $st.RecentTop) { $st.RecentTop = $st.RecentSel }
+                }
+                else { $st.Focus = "form"; $st.Sel = 12 }
+            } else {
+                if ($st.Sel -gt 0) { $st.Sel-- }
+            }
+        }
+        "DownArrow" {
+            if ($st.Focus -eq "recent") {
+                if ($st.RecentSel -lt ($st.Recent.Count - 1)) {
+                    $st.RecentSel++
+                    $recentVisible = [Math]::Max(1, [int](Get-GcrTuiSize).H - 10)
+                    if ($st.RecentSel -ge $st.RecentTop + $recentVisible) {
+                        $st.RecentTop = $st.RecentSel - $recentVisible + 1
                     }
-                    else { $st.Focus = "form"; $st.Sel = 12 }
+                }
+            } else {
+                if ($st.Sel -lt 12) { $st.Sel++ }
+                elseif ($st.Recent.Count -gt 0) {
+                    $st.Focus = "recent"
+                    $st.RecentSel = [Math]::Min($st.RecentSel, $st.Recent.Count - 1)
+                    $recentVisible = [Math]::Max(1, [int](Get-GcrTuiSize).H - 10)
+                    $st.RecentTop = [Math]::Max(0, $st.RecentSel - $recentVisible + 1)
+                }
+            }
+        }
+        "K" {
+            if ($K.KeyChar -eq "k") {
+                if ($st.Focus -eq "form" -and $st.Sel -gt 0) { $st.Sel-- }
+            }
+        }
+        "J" {
+            if ($K.KeyChar -eq "j") {
+                if ($st.Focus -eq "form" -and $st.Sel -lt 12) { $st.Sel++ }
+            }
+        }
+        "LeftArrow" {
+            if ($st.Focus -eq "form" -and $st.Sel -eq 11) {
+                $st.Language = "zh-CN"
+            }
+            if ($st.Focus -eq "form" -and $st.Sel -eq 3) {
+                $idx = [array]::IndexOf($batches, [int]$st.BatchSize)
+                if ($idx -lt 0) { $idx = 2 }
+                if ($idx -gt 0) { $st.BatchSize = $batches[$idx - 1] }
+            }
+            if ($st.Focus -eq "form" -and $st.Sel -eq 4) {
+                $idx = [array]::IndexOf($retriesSet, [int]$st.MaxRetries)
+                if ($idx -lt 0) { $idx = 2 }
+                if ($idx -gt 0) { $st.MaxRetries = $retriesSet[$idx - 1] }
+            }
+        }
+        "RightArrow" {
+            if ($st.Focus -eq "form" -and $st.Sel -eq 11) {
+                $st.Language = "en-US"
+            }
+            if ($st.Focus -eq "form" -and $st.Sel -eq 3) {
+                $idx = [array]::IndexOf($batches, [int]$st.BatchSize)
+                if ($idx -lt 0) { $idx = 2 }
+                if ($idx -lt $batches.Count - 1) { $st.BatchSize = $batches[$idx + 1] }
+            }
+            if ($st.Focus -eq "form" -and $st.Sel -eq 4) {
+                $idx = [array]::IndexOf($retriesSet, [int]$st.MaxRetries)
+                if ($idx -lt 0) { $idx = 2 }
+                if ($idx -lt $retriesSet.Count - 1) { $st.MaxRetries = $retriesSet[$idx + 1] }
+            }
+        }
+        "Spacebar" {
+            if ($st.Focus -eq "form") {
+                if ($st.Sel -eq 8) { $st.Verify = -not $st.Verify }
+                elseif ($st.Sel -eq 9) { $st.ForceRefetch = -not $st.ForceRefetch }
+                elseif ($st.Sel -eq 10) { $st.DryRun = -not $st.DryRun }
+                elseif ($st.Sel -eq 11) { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); Set-GcrLanguage -Language $st.Language }
+            }
+        }
+        "Enter" {
+            if ($st.Focus -eq "recent") {
+                if ($st.Recent.Count -gt 0) { Apply-GcrRecentToWizard -St $st -Item $st.Recent[$st.RecentSel] }
+                break
+            }
+            $wizItems = @(Get-GcrWizardItems -St $st)
+            if ($st.Sel -lt 0 -or $st.Sel -ge $wizItems.Count) { break }
+            $id = [string]$wizItems[$st.Sel].Id
+            if ($id -eq "start") {
+                if ([string]::IsNullOrWhiteSpace($st.Url) -or $st.Url -match "\s") {
+                    $st.Error = "请填写仓库 URL（Ctrl+V 可从剪贴板粘贴）"
+                    $st.Sel = 0
                 } else {
-                    if ($st.Sel -gt 0) { $st.Sel-- }
-                }
-            }
-            "DownArrow" {
-                if ($st.Focus -eq "recent") {
-                    if ($st.RecentSel -lt ($st.Recent.Count - 1)) {
-                        $st.RecentSel++
-                        $recentVisible = [Math]::Max(1, [int](Get-GcrTuiSize).H - 10)
-                        if ($st.RecentSel -ge $st.RecentTop + $recentVisible) {
-                            $st.RecentTop = $st.RecentSel - $recentVisible + 1
-                        }
-                    }
-                } else {
-                    if ($st.Sel -lt 12) { $st.Sel++ }
-                    elseif ($st.Recent.Count -gt 0) {
-                        $st.Focus = "recent"
-                        $st.RecentSel = [Math]::Min($st.RecentSel, $st.Recent.Count - 1)
-                        $recentVisible = [Math]::Max(1, [int](Get-GcrTuiSize).H - 10)
-                        $st.RecentTop = [Math]::Max(0, $st.RecentSel - $recentVisible + 1)
-                    }
-                }
-            }
-            "K" {
-                if ($k.KeyChar -eq "k") {
-                    if ($st.Focus -eq "form" -and $st.Sel -gt 0) { $st.Sel-- }
-                }
-            }
-            "J" {
-                if ($k.KeyChar -eq "j") {
-                    if ($st.Focus -eq "form" -and $st.Sel -lt 12) { $st.Sel++ }
-                }
-            }
-            "LeftArrow" {
-                if ($st.Focus -eq "form" -and $st.Sel -eq 11) {
-                    $st.Language = "zh-CN"
-                }
-                if ($st.Focus -eq "form" -and $st.Sel -eq 3) {
-                    $idx = [array]::IndexOf($batches, [int]$st.BatchSize)
-                    if ($idx -lt 0) { $idx = 2 }
-                    if ($idx -gt 0) { $st.BatchSize = $batches[$idx - 1] }
-                }
-                if ($st.Focus -eq "form" -and $st.Sel -eq 4) {
-                    $idx = [array]::IndexOf($retriesSet, [int]$st.MaxRetries)
-                    if ($idx -lt 0) { $idx = 2 }
-                    if ($idx -gt 0) { $st.MaxRetries = $retriesSet[$idx - 1] }
-                }
-            }
-            "RightArrow" {
-                if ($st.Focus -eq "form" -and $st.Sel -eq 11) {
-                    $st.Language = "en-US"
-                }
-                if ($st.Focus -eq "form" -and $st.Sel -eq 3) {
-                    $idx = [array]::IndexOf($batches, [int]$st.BatchSize)
-                    if ($idx -lt 0) { $idx = 2 }
-                    if ($idx -lt $batches.Count - 1) { $st.BatchSize = $batches[$idx + 1] }
-                }
-                if ($st.Focus -eq "form" -and $st.Sel -eq 4) {
-                    $idx = [array]::IndexOf($retriesSet, [int]$st.MaxRetries)
-                    if ($idx -lt 0) { $idx = 2 }
-                    if ($idx -lt $retriesSet.Count - 1) { $st.MaxRetries = $retriesSet[$idx + 1] }
-                }
-            }
-            "Spacebar" {
-                if ($st.Focus -eq "form") {
-                    if ($st.Sel -eq 8) { $st.Verify = -not $st.Verify }
-                    elseif ($st.Sel -eq 9) { $st.ForceRefetch = -not $st.ForceRefetch }
-                    elseif ($st.Sel -eq 10) { $st.DryRun = -not $st.DryRun }
-                    elseif ($st.Sel -eq 11) { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); Set-GcrLanguage -Language $st.Language }
-                }
-            }
-            "Enter" {
-                if ($st.Focus -eq "recent") {
-                    if ($st.Recent.Count -gt 0) { Apply-GcrRecentToWizard -St $st -Item $st.Recent[$st.RecentSel] }
-                    break
-                }
-                $wizItems = @(Get-GcrWizardItems -St $st)
-                if ($st.Sel -lt 0 -or $st.Sel -ge $wizItems.Count) { break }
-                $id = [string]$wizItems[$st.Sel].Id
-                if ($id -eq "start") {
-                    if ([string]::IsNullOrWhiteSpace($st.Url) -or $st.Url -match "\s") {
-                        $st.Error = "请填写仓库 URL（Ctrl+V 可从剪贴板粘贴）"
-                        $st.Sel = 0
-                    } else {
-                        try {
-                            $result = Convert-GcrWizardResult -St $st
-                            $script:GcrTui.Screen = "dash"
-                            $script:GcrTui.Logs.Clear()
-                            return ,$result
-                        } catch {
-                            $st.Error = "无法开始: " + $_.Exception.Message
-                            $script:GcrTui.Screen = "wizard"
-                        }
-                    }
-                } elseif ($id -eq "verify") { $st.Verify = -not $st.Verify }
-                elseif ($id -eq "force") { $st.ForceRefetch = -not $st.ForceRefetch }
-                elseif ($id -eq "dry") { $st.DryRun = -not $st.DryRun }
-                elseif ($id -eq "language") { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); Set-GcrLanguage -Language $st.Language }
-                elseif ($id -eq "batch" -or $id -eq "retry") { }
-                else {
-                    $st.Edit = $true
-                    $st.EditField = $id
-                    $map = @{
-                        url     = $st.Url
-                        dir     = $st.OutDir
-                        ref     = $st.Ref
-                        include = $st.Include
-                        exclude = $st.Exclude
-                        depth   = $st.Depth
-                    }
-                    $st.EditBuf = [string]$map[$id]
-                    $st.EditCur = $st.EditBuf.Length
-                }
-            }
-            "S" {
-                if (-not [string]::IsNullOrWhiteSpace($st.Url)) {
                     try {
                         $result = Convert-GcrWizardResult -St $st
                         $script:GcrTui.Screen = "dash"
                         $script:GcrTui.Logs.Clear()
-                        return ,$result
+                        return "start"
                     } catch {
                         $st.Error = "无法开始: " + $_.Exception.Message
                         $script:GcrTui.Screen = "wizard"
                     }
                 }
-            }
-            default {
-                if ($k.KeyChar -eq "l" -or $k.KeyChar -eq "L") {
-                    $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" })
-                    Set-GcrLanguage -Language $st.Language
+            } elseif ($id -eq "verify") { $st.Verify = -not $st.Verify }
+            elseif ($id -eq "force") { $st.ForceRefetch = -not $st.ForceRefetch }
+            elseif ($id -eq "dry") { $st.DryRun = -not $st.DryRun }
+            elseif ($id -eq "language") { $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" }); Set-GcrLanguage -Language $st.Language }
+            elseif ($id -eq "batch" -or $id -eq "retry") { }
+            else {
+                $st.Edit = $true
+                $st.EditField = $id
+                $map = @{
+                    url     = $st.Url
+                    dir     = $st.OutDir
+                    ref     = $st.Ref
+                    include = $st.Include
+                    exclude = $st.Exclude
+                    depth   = $st.Depth
                 }
-                if ($k.KeyChar -eq "?") { $st.Error = "Enter 编辑 · Space 开关 · Tab 最近任务 · S 开始 · Q 退出" }
+                $st.EditBuf = [string]$map[$id]
+                $st.EditCur = $st.EditBuf.Length
             }
         }
-        if ($k.Key -ne "Enter" -and $k.Key -ne "Delete" -and -not (Test-GcrCtrlKey $k "D")) { $st.Error = "" }
+        "S" {
+            if ([string]::IsNullOrWhiteSpace($st.Url)) {
+                $st.Error = "请填写仓库 URL（Ctrl+V 可从剪贴板粘贴）"
+                $st.Sel = 0
+            } else {
+                # The caller builds the result; returning the action keeps one
+                # start path instead of two.
+                return "start"
+            }
+        }
+        default {
+            if ($K.KeyChar -eq "l" -or $K.KeyChar -eq "L") {
+                $st.Language = $(if ($st.Language -eq "en-US") { "zh-CN" } else { "en-US" })
+                Set-GcrLanguage -Language $st.Language
+            }
+            if ($K.KeyChar -eq "?") { $st.Error = "Enter 编辑 · Space 开关 · Tab 最近任务 · S 开始 · Q 退出" }
+        }
     }
-    return $null
+    if ($K.Key -ne "Enter" -and $K.Key -ne "Delete" -and -not (Test-GcrCtrlKey $K "D")) { $St.Error = "" }
+    return "continue"
 }
 
+# Handles a left click anywhere on the wizard: a form row selects that item and
+# acts on it (so clicking the start row starts, clicking a bool toggles, clicking
+# a text field edits), and a recent-task row fills the form from it.
+function Invoke-GcrWizardMouse {
+    param($St, [int]$X, [int]$Y)
+    if ($null -eq $script:GcrMouseHit) { return "continue" }
+    if (-not $script:GcrMouseHit.ContainsKey($Y)) { return "continue" }
+
+    # A click resolves a pending confirmation first: confirming is the safe
+    # reading, and no row is actionable while the prompt is up.
+    if ($St.ConfirmQuit) { return "close" }
+    if ($St.ConfirmClearAll) { return Invoke-GcrWizardEvent -St $St -K (New-GcrSyntheticKey "Enter") }
+    if ($St.ConfirmClearOne) { return Invoke-GcrWizardEvent -St $St -K (New-GcrSyntheticKey "Enter") }
+
+    $hit = $script:GcrMouseHit[$Y]
+    if ($hit.Kind -eq "recent") {
+        $St.Focus = "recent"
+        $St.RecentSel = [int]$hit.Index
+        return Invoke-GcrWizardEvent -St $St -K (New-GcrSyntheticKey "Enter")
+    }
+
+    $index = [int]$hit.Index
+    $St.Focus = "form"
+    if ($St.Edit -and [int]$St.Sel -ne $index) {
+        # Clicking away from a field being edited commits it first.
+        $null = Invoke-GcrWizardEvent -St $St -K (New-GcrSyntheticKey "Enter")
+    }
+    if ($St.Edit) {
+        # The click landed on the field already being edited; keep its caret.
+        return "continue"
+    }
+    $St.Sel = $index
+    return Invoke-GcrWizardEvent -St $St -K (New-GcrSyntheticKey "Enter")
+}
+
+# A key event the TUI generated itself, so a click can reuse the keyboard paths
+# instead of duplicating "what Enter does" in two places.
+function New-GcrSyntheticKey {
+    param([string]$Key)
+    return New-Object System.ConsoleKeyInfo([char]0, ([ConsoleKey]$Key), $false, $false, $false)
+}
 function Show-GcrCliWizard {
     param([hashtable]$Defaults)
     Write-Host ""
